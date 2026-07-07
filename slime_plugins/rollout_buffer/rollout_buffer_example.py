@@ -45,8 +45,10 @@ def select_rollout_data(args, results, need_length):
 
     print(f"📊 Total groups: {len(groups)}, total samples: {len(results)}")
 
-    # If we don't have too many samples, return all
-    assert need_length < len(results), "need_length must be smaller than results length"
+    # Return grouped records even when there is no over-collection; downstream
+    # expects prompt-group shape, not a flat record list.
+    if len(groups) <= need_length:
+        return list(groups.values())
 
     # Get timestamp for each group (use the latest timestamp in the group)
     def get_group_timestamp(group_items):
@@ -189,6 +191,18 @@ def start_rollout(api_base_url: str, args, metadata):
             "top_p": args.rollout_top_p,
         },
         "tokenizer_path": args.hf_checkpoint,
+        "input_key": getattr(args, "input_key", "prompt"),
+        "label_key": getattr(args, "label_key", "label"),
+        "metadata_key": getattr(args, "metadata_key", "metadata"),
+        "tool_key": getattr(args, "tool_key", None),
+        "apply_chat_template": getattr(args, "apply_chat_template", False),
+        "apply_chat_template_kwargs": getattr(args, "apply_chat_template_kwargs", {}) or {},
+        "rollout_batch_size": args.rollout_batch_size,
+        "rollout_max_context_len": getattr(args, "rollout_max_context_len", 0),
+        "rollout_seed": getattr(args, "rollout_seed", 42),
+        "rollout_shuffle": getattr(args, "rollout_shuffle", False),
+        "sglang_tool_call_parser": getattr(args, "sglang_tool_call_parser", None),
+        "sglang_reasoning_parser": getattr(args, "sglang_reasoning_parser", None),
         "skip_instance_ids": finished_groups_instance_id_list,
     }
     print("start rollout with payload: ", payload)
@@ -269,6 +283,11 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer, evaluation:
     for _i, group_record in enumerate(results):
         group_results = []
         for record in group_record:
+            if "samples" in record:
+                compact_samples = [Sample.from_dict(item) for item in record["samples"]]
+                group_results.append(compact_samples)
+                continue
+
             oai_messages = record["messages"]
 
             mask_generator = MultiTurnLossMaskGenerator(tokenizer, tokenizer_type=args.loss_mask_type)
