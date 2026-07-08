@@ -37,30 +37,39 @@ def run_rollout(data: dict[str, Any]) -> str:
     skip_instance_ids = data.get("skip_instance_ids") or []
 
     logger.info(
-        "[ags_generator] start task_type=%s groups_per_epoch=%s repeats=%s epochs=%s buffer=%s",
+        "[ags_generator] start task_type=%s groups_per_epoch=%s repeats=%s epochs=%s concurrency=%s buffer=%s",
         TASK_TYPE,
         groups_per_epoch,
         args.n_samples_per_prompt,
         num_epoch,
+        config.rollout_concurrency,
         remote_buffer_url,
     )
 
+    async def _run_sample(epoch: int, sample: Sample) -> None:
+        outputs = await runner.generate(sample, args.sampling_params)
+        first = outputs[0]
+        instance_id = _instance_id(first)
+        item = output_item_from_samples(
+            outputs,
+            instance_id=instance_id,
+            extra_info={
+                "epoch": epoch,
+                "task_type": TASK_TYPE,
+                "reward": first.reward,
+                **(first.metadata or {}),
+            },
+        )
+        await asyncio.to_thread(_send_data_to_buffer, remote_buffer_url, item)
+
     async def _run_epoch(epoch: int, samples: list[Sample]) -> None:
-        for sample in samples:
-            outputs = await runner.generate(sample, args.sampling_params)
-            first = outputs[0]
-            instance_id = _instance_id(first)
-            item = output_item_from_samples(
-                outputs,
-                instance_id=instance_id,
-                extra_info={
-                    "epoch": epoch,
-                    "task_type": TASK_TYPE,
-                    "reward": first.reward,
-                    **(first.metadata or {}),
-                },
-            )
-            _send_data_to_buffer(remote_buffer_url, item)
+        semaphore = asyncio.Semaphore(config.rollout_concurrency)
+
+        async def _guarded(sample: Sample) -> None:
+            async with semaphore:
+                await _run_sample(epoch, sample)
+
+        await asyncio.gather(*(_guarded(sample) for sample in samples))
 
     for epoch in range(num_epoch):
         samples = source.get_repeated_samples(groups_per_epoch, skip_instance_ids=skip_instance_ids)

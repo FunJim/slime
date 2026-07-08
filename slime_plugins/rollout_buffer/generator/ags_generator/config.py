@@ -18,6 +18,7 @@ class AGSGeneratorConfig:
     eval_bootstrap_cmd: str | None
     rollout_guard_sec: int
     boot_concurrency: int
+    rollout_concurrency: int
     boot_retries: int
     artifact_dir: str | None
     prompt: str
@@ -28,6 +29,7 @@ class AGSGeneratorConfig:
         eval_timeout = int(os.environ.get("SWE_EVAL_TIMEOUT_SEC", "600"))
         guard = int(os.environ.get("SWE_ROLLOUT_GUARD_SEC", "0") or 0) or (agent_time_budget + eval_timeout + 180)
         fork = int(v) if (v := os.environ.get("SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS")) else None
+        rollout_concurrency = int(os.environ.get("SWE_ROLLOUT_CONCURRENCY", "1"))
         return cls(
             agent_name=os.environ.get("SWE_AGENT", "claude_code"),
             adapter_public_host=os.environ.get("ADAPTER_PUBLIC_HOST"),
@@ -39,6 +41,7 @@ class AGSGeneratorConfig:
             eval_bootstrap_cmd=os.environ.get("SWE_EVAL_BOOTSTRAP_CMD") or None,
             rollout_guard_sec=guard,
             boot_concurrency=int(os.environ.get("SWE_BOOT_CONCURRENCY", "16")),
+            rollout_concurrency=max(1, rollout_concurrency),
             boot_retries=int(os.environ.get("SWE_BOOT_RETRIES", "2")),
             artifact_dir=os.environ.get("TRAJECTORY_DUMP_DIR", "").strip() or None,
             prompt=os.environ.get(
