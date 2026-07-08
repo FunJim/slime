@@ -98,28 +98,85 @@ def is_valid_group(group, min_valid_group_size: int, task_type: str = TASK_TYPE)
 def get_group_data_meta_info(temp_data: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
     rewards = []
     status_counts: dict[str, int] = {}
-    artifact_counts = {"trajectory": 0, "patch": 0, "rollout_dump": 0}
+    artifact_counts = {"trajectory": 0, "patch": 0, "rollout_dump": 0, "complete": 0}
+    elapsed_secs = []
+    agent_exit_nonzero = 0
+    applied_cleanly = 0
+    rollout_concurrency = 0
+    total_samples = 0
+    total_rollouts = sum(len(items) for items in temp_data.values())
+
     for items in temp_data.values():
         for item in items:
             samples = samples_from_payload(item)
             for sample in samples:
+                total_samples += 1
                 if sample.reward is not None:
                     rewards.append(float(sample.reward))
                 status_counts[sample.status.value] = status_counts.get(sample.status.value, 0) + 1
                 metadata = sample.metadata or {}
-                artifact_counts["trajectory"] += int(bool(metadata.get("trajectory_path")))
-                artifact_counts["patch"] += int(bool(metadata.get("patch_path")))
-                artifact_counts["rollout_dump"] += int(bool(metadata.get("rollout_dump_path")))
-    total = sum(len(items) for items in temp_data.values())
+                has_trajectory = bool(metadata.get("trajectory_path"))
+                has_patch = bool(metadata.get("patch_path"))
+                has_rollout_dump = bool(metadata.get("rollout_dump_path"))
+                artifact_counts["trajectory"] += int(has_trajectory)
+                artifact_counts["patch"] += int(has_patch)
+                artifact_counts["rollout_dump"] += int(has_rollout_dump)
+                artifact_counts["complete"] += int(has_trajectory and has_patch and has_rollout_dump)
+                elapsed_sec = _float_or_none(metadata.get("ags_elapsed_sec"))
+                if elapsed_sec is not None:
+                    elapsed_secs.append(elapsed_sec)
+                agent_exit_nonzero += int((metadata.get("agent_exit_code") or 0) != 0)
+                applied_cleanly += int(bool(metadata.get("applied_cleanly")))
+                rollout_concurrency = max(rollout_concurrency, int(metadata.get("ags_rollout_concurrency") or 0))
+
+    completed = status_counts.get(Sample.Status.COMPLETED.value, 0)
+    aborted = status_counts.get(Sample.Status.ABORTED.value, 0)
+    solved = sum(1 for reward in rewards if reward == 1.0)
+    nonzero = sum(1 for reward in rewards if reward != 0)
     return {
-        "total_samples": total,
+        "total_samples": total_samples,
+        "total_rollouts": total_rollouts,
         "num_groups": len(temp_data),
-        "avg_group_size": total / len(temp_data) if temp_data else 0,
+        "avg_group_size": total_rollouts / len(temp_data) if temp_data else 0,
+        "avg_samples_per_group": total_samples / len(temp_data) if temp_data else 0,
         "avg_reward": sum(rewards) / len(rewards) if rewards else 0,
-        "nonzero_reward_samples": sum(1 for reward in rewards if reward != 0),
+        "nonzero_reward_samples": nonzero,
+        "solved_samples": solved,
+        "solve_rate": solved / len(rewards) if rewards else 0,
+        "nonzero_reward_rate": nonzero / len(rewards) if rewards else 0,
+        "completed_rate": completed / total_samples if total_samples else 0,
+        "abort_rate": aborted / total_samples if total_samples else 0,
+        "artifact_complete_rate": artifact_counts["complete"] / total_samples if total_samples else 0,
         "status_counts": status_counts,
         "artifact_counts": artifact_counts,
+        "performance": {
+            "rollout_concurrency": rollout_concurrency,
+            "avg_elapsed_sec": sum(elapsed_secs) / len(elapsed_secs) if elapsed_secs else 0,
+            "p50_elapsed_sec": _percentile(elapsed_secs, 0.50),
+            "p95_elapsed_sec": _percentile(elapsed_secs, 0.95),
+            "max_elapsed_sec": max(elapsed_secs) if elapsed_secs else 0,
+            "elapsed_sec_values": elapsed_secs,
+            "agent_exit_nonzero_count": agent_exit_nonzero,
+            "applied_cleanly_count": applied_cleanly,
+        },
     }
+
+
+def _float_or_none(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _percentile(values: list[float], quantile: float) -> float:
+    if not values:
+        return 0
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, int(round((len(ordered) - 1) * quantile))))
+    return ordered[index]
 
 
 def _build_args(data: dict[str, Any]) -> Namespace:

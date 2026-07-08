@@ -90,51 +90,174 @@ def select_rollout_data(args, results, need_length):
 
 
 def log_raw_info(args, all_meta_info, rollout_id):
-    final_meta_info = {}
-    if all_meta_info:
-        final_meta_info = {
-            "total_samples": sum(meta["total_samples"] for meta in all_meta_info if "total_samples" in meta)
+    if not all_meta_info:
+        return
+
+    final_meta_info = _merge_rollout_meta_info(all_meta_info)
+    if final_meta_info.get("total_samples", 0) <= 0:
+        print(f"no filter rollout log {rollout_id}: {final_meta_info}")
+        return
+
+    try:
+        step = (
+            rollout_id
+            if not args.wandb_always_use_train_step
+            else rollout_id * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
+        )
+        log_dict = _flatten_numeric_metrics("rollout/no_filter", final_meta_info)
+        if getattr(args, "rollout_task_type", None) == "ags":
+            log_dict.update(_flatten_numeric_metrics("rollout/ags", final_meta_info))
+        log_dict["rollout/step"] = step
+        if args.use_wandb:
+            wandb.log(log_dict)
+
+        if args.use_tensorboard:
+            from slime.utils.tensorboard_utils import _TensorboardAdapter
+
+            tb = _TensorboardAdapter(args)
+            tb.log(data=log_dict, step=step)
+        print(f"no filter rollout log {rollout_id}: {log_dict}")
+    except Exception as e:
+        print(f"Failed to log rollout metrics: {e}")
+        print(f"no filter rollout log {rollout_id}: {final_meta_info}")
+
+
+def _merge_rollout_meta_info(all_meta_info: list[dict[str, Any]]) -> dict[str, Any]:
+    total_samples = sum(int(meta.get("total_samples", 0) or 0) for meta in all_meta_info)
+    merged: dict[str, Any] = {"total_samples": total_samples}
+    if total_samples <= 0:
+        return merged
+
+    merged["num_groups"] = sum(int(meta.get("num_groups", 0) or 0) for meta in all_meta_info)
+
+    if any("total_rollouts" in meta for meta in all_meta_info):
+        merged["total_rollouts"] = sum(
+            int(meta.get("total_rollouts", meta.get("total_samples", 0)) or 0) for meta in all_meta_info
+        )
+
+    for key in ["nonzero_reward_samples", "solved_samples"]:
+        if any(key in meta for meta in all_meta_info):
+            merged[key] = sum(int(meta.get(key, 0) or 0) for meta in all_meta_info)
+
+    weighted_avg_keys = [
+        "avg_reward",
+        "solve_rate",
+        "nonzero_reward_rate",
+        "completed_rate",
+        "abort_rate",
+        "artifact_complete_rate",
+    ]
+    for key in weighted_avg_keys:
+        if not any(key in meta for meta in all_meta_info):
+            continue
+        weighted_sum = sum(
+            float(meta[key]) * int(meta.get("total_samples", 0) or 0)
+            for meta in all_meta_info
+            if key in meta and meta.get("total_samples", 0)
+        )
+        merged[key] = weighted_sum / total_samples
+
+    num_groups = int(merged.get("num_groups", 0) or 0)
+    if "total_rollouts" in merged:
+        merged["avg_group_size"] = int(merged["total_rollouts"]) / num_groups if num_groups else 0
+        merged["avg_samples_per_group"] = total_samples / num_groups if num_groups else 0
+    elif any("avg_group_size" in meta for meta in all_meta_info):
+        weighted_sum = sum(
+            float(meta["avg_group_size"]) * int(meta.get("total_samples", 0) or 0)
+            for meta in all_meta_info
+            if "avg_group_size" in meta and meta.get("total_samples", 0)
+        )
+        merged["avg_group_size"] = weighted_sum / total_samples
+
+    for key in ["status_counts", "artifact_counts"]:
+        if any(key in meta for meta in all_meta_info):
+            merged[key] = _sum_nested_counts(meta.get(key, {}) for meta in all_meta_info)
+
+    performance_items = [meta.get("performance", {}) for meta in all_meta_info]
+    if any(performance_items):
+        elapsed_sec_values = [
+            float(value)
+            for item in performance_items
+            if isinstance(item, dict)
+            for value in item.get("elapsed_sec_values", [])
+        ]
+        merged["performance"] = {
+            "rollout_concurrency": _max_nested(performance_items, "rollout_concurrency"),
+            "avg_elapsed_sec": (
+                sum(elapsed_sec_values) / len(elapsed_sec_values)
+                if elapsed_sec_values
+                else _weighted_average_nested(performance_items, all_meta_info, "avg_elapsed_sec")
+            ),
+            "p50_elapsed_sec": (
+                _percentile(elapsed_sec_values, 0.50)
+                if elapsed_sec_values
+                else _max_nested(performance_items, "p50_elapsed_sec")
+            ),
+            "p95_elapsed_sec": (
+                _percentile(elapsed_sec_values, 0.95)
+                if elapsed_sec_values
+                else _max_nested(performance_items, "p95_elapsed_sec")
+            ),
+            "max_elapsed_sec": (
+                max(elapsed_sec_values) if elapsed_sec_values else _max_nested(performance_items, "max_elapsed_sec")
+            ),
+            "agent_exit_nonzero_count": sum(
+                int(item.get("agent_exit_nonzero_count", 0) or 0) for item in performance_items
+            ),
+            "applied_cleanly_count": sum(int(item.get("applied_cleanly_count", 0) or 0) for item in performance_items),
         }
+    return merged
 
-        total_samples = final_meta_info["total_samples"]
-        if total_samples > 0:
-            weighted_reward_sum = sum(
-                meta["avg_reward"] * meta["total_samples"]
-                for meta in all_meta_info
-                if "avg_reward" in meta and "total_samples" in meta
-            )
 
-            final_meta_info.update(
-                {
-                    "avg_reward": weighted_reward_sum / total_samples,
-                }
-            )
-            if args.use_wandb:
-                log_dict = {
-                    "rollout/no_filter/total_samples": final_meta_info["total_samples"],
-                    "rollout/no_filter/avg_reward": final_meta_info["avg_reward"],
-                }
-                try:
-                    step = (
-                        rollout_id
-                        if not args.wandb_always_use_train_step
-                        else rollout_id * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
-                    )
-                    if args.use_wandb:
-                        log_dict["rollout/step"] = step
-                        wandb.log(log_dict)
+def _sum_nested_counts(dicts) -> dict[str, int]:
+    output: dict[str, int] = {}
+    for data in dicts:
+        if not isinstance(data, dict):
+            continue
+        for key, value in data.items():
+            if isinstance(value, bool):
+                value = int(value)
+            if isinstance(value, int | float):
+                output[str(key)] = output.get(str(key), 0) + int(value)
+    return output
 
-                    if args.use_tensorboard:
-                        from slime.utils.tensorboard_utils import _TensorboardAdapter
 
-                        tb = _TensorboardAdapter(args)
-                        tb.log(data=log_dict, step=step)
-                    print(f"no filter rollout log {rollout_id}: {log_dict}")
-                except Exception as e:
-                    print(f"Failed to log to wandb: {e}")
-                    print(f"no filter rollout log {rollout_id}: {final_meta_info}")
-            else:
-                print(f"no filter rollout log {rollout_id}: {final_meta_info}")
+def _weighted_average_nested(items: list[dict[str, Any]], all_meta_info: list[dict[str, Any]], key: str) -> float:
+    weighted_sum = 0.0
+    total_weight = 0
+    for item, meta in zip(items, all_meta_info, strict=False):
+        if key not in item:
+            continue
+        weight = int(meta.get("total_samples", 0) or 0)
+        weighted_sum += float(item[key]) * weight
+        total_weight += weight
+    return weighted_sum / total_weight if total_weight else 0
+
+
+def _max_nested(items: list[dict[str, Any]], key: str) -> float:
+    values = [float(item[key]) for item in items if isinstance(item, dict) and key in item]
+    return max(values) if values else 0
+
+
+def _percentile(values: list[float], quantile: float) -> float:
+    if not values:
+        return 0
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, int(round((len(ordered) - 1) * quantile))))
+    return ordered[index]
+
+
+def _flatten_numeric_metrics(prefix: str, data: dict[str, Any]) -> dict[str, int | float]:
+    metrics: dict[str, int | float] = {}
+    for key, value in data.items():
+        metric_key = f"{prefix}/{key}"
+        if isinstance(value, bool):
+            metrics[metric_key] = int(value)
+        elif isinstance(value, int | float):
+            metrics[metric_key] = value
+        elif isinstance(value, dict):
+            metrics.update(_flatten_numeric_metrics(metric_key, value))
+    return metrics
 
 
 async def get_rollout_data(api_base_url: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:

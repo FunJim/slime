@@ -103,6 +103,7 @@ class AGSRolloutRunner:
                     },
                     artifact_id,
                 )
+                elapsed_sec = time.time() - t0
                 for sample in samples:
                     sample.metadata = {
                         **(sample.metadata or {}),
@@ -112,6 +113,9 @@ class AGSRolloutRunner:
                         "trajectory_path": trajectory_path,
                         "patch_path": patch_path,
                         "rollout_dump_path": rollout_path,
+                        "ags_elapsed_sec": elapsed_sec,
+                        "ags_num_samples": len(samples),
+                        "ags_rollout_concurrency": self.config.rollout_concurrency,
                     }
                 logger.info(
                     "[ags_generator] %s: reward=%.2f applied=%s exit=%s elapsed=%.1fs segments=%d",
@@ -119,7 +123,7 @@ class AGSRolloutRunner:
                     float(reward),
                     bool(applied_cleanly),
                     agent_exit_code,
-                    time.time() - t0,
+                    elapsed_sec,
                     len(samples),
                 )
                 return samples
