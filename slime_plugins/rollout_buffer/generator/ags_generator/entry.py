@@ -67,7 +67,35 @@ def run_rollout(data: dict[str, Any]) -> str:
 
         async def _guarded(sample: Sample) -> None:
             async with semaphore:
-                await _run_sample(epoch, sample)
+                try:
+                    await _run_sample(epoch, sample)
+                except Exception as exc:
+                    instance_id = _instance_id(sample)
+                    logger.exception(
+                        "[ags_generator] %s: sample task failed; writing aborted rollout: %s",
+                        instance_id,
+                        exc,
+                    )
+                    outputs = runner._abort_result(sample, f"task_exception:{type(exc).__name__}", instance_id)
+                    first = outputs[0]
+                    item = output_item_from_samples(
+                        outputs,
+                        instance_id=instance_id,
+                        extra_info={
+                            "epoch": epoch,
+                            "task_type": TASK_TYPE,
+                            "reward": first.reward,
+                            **(first.metadata or {}),
+                        },
+                    )
+                    try:
+                        await asyncio.to_thread(_send_data_to_buffer, remote_buffer_url, item)
+                    except Exception as send_exc:
+                        logger.exception(
+                            "[ags_generator] %s: failed to write aborted rollout after task failure: %s",
+                            instance_id,
+                            send_exc,
+                        )
 
         await asyncio.gather(*(_guarded(sample) for sample in samples))
 

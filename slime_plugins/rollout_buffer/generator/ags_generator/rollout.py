@@ -40,16 +40,20 @@ class AGSRolloutRunner:
         if not md["image"] or not md["workdir"]:
             return self._abort_result(base_sample, "missing_image_or_workdir", instance_id)
 
-        session_id = base_sample.session_id = _session_id(base_sample, instance_id)
+        base_sample = copy.deepcopy(base_sample)
+        session_id = _session_id(base_sample, instance_id)
+        base_sample.session_id = session_id
         artifact_id = sample_artifact_id(instance_id, base_sample)
         normalized_sampling = normalize_sampling_params(sampling_params)
-        self.adapter_service.adapter.open_session(
-            session_id,
-            sampling_defaults=normalized_sampling,
-            max_context_tokens=self.adapter_service.max_context_len,
-        )
         t0 = time.time()
+        session_opened = False
         try:
+            self.adapter_service.adapter.open_session(
+                session_id,
+                sampling_defaults=normalized_sampling,
+                max_context_tokens=self.adapter_service.max_context_len,
+            )
+            session_opened = True
             async with asyncio.timeout(self.config.rollout_guard_sec):
                 async with self._boot_agent_sandbox(md["image"], instance_id) as sb:
                     await prepare_workspace(sb, md["workdir"], md)
@@ -134,7 +138,16 @@ class AGSRolloutRunner:
             logger.warning("[ags_generator] %s: rollout failed: %s\n%s", instance_id, exc, traceback.format_exc())
             return self._abort_result(base_sample, f"exception:{type(exc).__name__}", instance_id)
         finally:
-            await self.adapter_service.adapter.drop_session(session_id)
+            if session_opened:
+                try:
+                    await self.adapter_service.adapter.drop_session(session_id)
+                except Exception:
+                    logger.warning(
+                        "[ags_generator] %s: failed to drop session %s\n%s",
+                        instance_id,
+                        session_id,
+                        traceback.format_exc(),
+                    )
 
     @asynccontextmanager
     async def _boot_agent_sandbox(self, image: str, instance_id: str) -> AsyncIterator[AGSSandbox]:
@@ -187,11 +200,22 @@ class AGSRolloutRunner:
 
 
 def _session_id(sample: Sample, instance_id: str) -> str:
-    if sample.session_id:
-        return sample.session_id
-    if sample.index is not None and sample.group_index is not None:
-        return f"cagent-{instance_id}-{sample.index}-{sample.group_index}"
-    return f"cagent-{instance_id}-{secrets.token_hex(8)}"
+    """Return a fresh adapter session id for one AGS attempt.
+
+    RolloutDataSource can hand out deep copies of Samples that already carry a
+    session_id, and failed/partial reruns can also revisit the same
+    (instance_id, index, group_index).  Adapter sessions are process-global for
+    one generator run, so every AGS attempt must get a unique id instead of
+    reusing the sample's existing session_id.
+    """
+
+    parts = ["cagent", instance_id]
+    if sample.index is not None:
+        parts.append(str(sample.index))
+    if sample.group_index is not None:
+        parts.append(str(sample.group_index))
+    parts.append(secrets.token_hex(4))
+    return "-".join(parts)
 
 
 def _log_timeout_diagnostic(t0: float, instance_id: str, guard_sec: int) -> None:
