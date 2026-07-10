@@ -169,7 +169,15 @@ async def _run_swepro(ev: Sandbox, workdir: str, swepro: dict[str, Any], timeout
 
 
 async def _run_eval_cmd(ev: Sandbox, workdir: str, cmd: str, timeout: int) -> float:
-    ec, _, _ = await ev.exec(f"cd {workdir} && {cmd}", user="agent", check=False, timeout=timeout)
+    # Run eval_cmd as root. Harbor-derived SWE-bench verifier scripts preserve
+    # Harbor's canonical container layout and intentionally materialize
+    # /tests/config.json, /tests/test.sh, /logs/verifier, and a parser next to
+    # /testbed (via `cd ..`). The verified SWE-bench images do not pre-create
+    # those root-owned paths for the unprivileged agent user, and we want to run
+    # Harbor's test.sh verbatim rather than patching its paths. This happens only
+    # in the separate evaluator sandbox after the agent patch is collected, so
+    # hidden grading assets are not exposed to the agent sandbox.
+    ec, _, _ = await ev.exec(f"cd {workdir} && {cmd}", user="root", check=False, timeout=timeout)
     return 1.0 if ec == 0 else 0.0
 
 
