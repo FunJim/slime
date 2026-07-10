@@ -24,21 +24,42 @@ logger = logging.getLogger(__name__)
 def run_rollout(data: dict[str, Any]) -> str:
     """Generate AGS coding-agent trajectories and stream them into buffer.py."""
 
+    return run_rollout_for_task_type(data, task_type=TASK_TYPE)
+
+
+def run_rollout_for_task_type(
+    data: dict[str, Any],
+    *,
+    task_type: str,
+    source_cls: type[AGSPromptSource] = AGSPromptSource,
+    runner_cls: type[AGSRolloutRunner] = AGSRolloutRunner,
+) -> str:
+    """Generate AGS trajectories for a discoverable rollout-buffer task type.
+
+    ``buffer.py`` discovers one top-level ``*_generator.py`` file per task
+    type, but AGS-backed coding tasks should share the same sandbox lifecycle,
+    agent harness, adapter service, artifact handling, and reward evaluation.
+    This helper keeps that execution path in one place while allowing a thin
+    task-specific source/validation layer, e.g. ``harbor_ags``.
+    """
+
     logging.basicConfig(level=getattr(logging, data.get("log_level", "INFO"), logging.INFO))
     args = _build_args(data)
     config = AGSGeneratorConfig.from_env()
-    source = AGSPromptSource(args)
-    runner = AGSRolloutRunner(args, config)
+    source = source_cls(args)
+    runner = runner_cls(args, config)
     remote_buffer_url = data["remote_buffer_url"].rstrip("/") + "/buffer/write"
     num_epoch = int(data.get("num_epoch", 1))
     groups_per_epoch = int(
         data.get("rollout_batch_size") or data.get("num_groups_per_epoch") or args.rollout_batch_size
     )
     skip_instance_ids = data.get("skip_instance_ids") or []
+    log_prefix = f"{task_type}_generator"
 
     logger.info(
-        "[ags_generator] start task_type=%s groups_per_epoch=%s repeats=%s epochs=%s concurrency=%s buffer=%s",
-        TASK_TYPE,
+        "[%s] start task_type=%s groups_per_epoch=%s repeats=%s epochs=%s concurrency=%s buffer=%s",
+        log_prefix,
+        task_type,
         groups_per_epoch,
         args.n_samples_per_prompt,
         num_epoch,
@@ -55,7 +76,7 @@ def run_rollout(data: dict[str, Any]) -> str:
             instance_id=instance_id,
             extra_info={
                 "epoch": epoch,
-                "task_type": TASK_TYPE,
+                "task_type": task_type,
                 "reward": first.reward,
                 **(first.metadata or {}),
             },
@@ -83,7 +104,7 @@ def run_rollout(data: dict[str, Any]) -> str:
                         instance_id=instance_id,
                         extra_info={
                             "epoch": epoch,
-                            "task_type": TASK_TYPE,
+                            "task_type": task_type,
                             "reward": first.reward,
                             **(first.metadata or {}),
                         },
