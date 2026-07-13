@@ -312,6 +312,7 @@ def start_rollout(api_base_url: str, args, metadata):
             "max_tokens": args.rollout_max_response_len,
             "temperature": args.rollout_temperature,
             "top_p": args.rollout_top_p,
+            "top_k": args.rollout_top_k,
         },
         "tokenizer_path": args.hf_checkpoint,
         "input_key": getattr(args, "input_key", "prompt"),
