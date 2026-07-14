@@ -26,7 +26,7 @@ def run_rollout(data: dict[str, Any]) -> str:
 
     logging.basicConfig(level=getattr(logging, data.get("log_level", "INFO"), logging.INFO))
     args = _build_args(data)
-    config = AGSGeneratorConfig.from_env()
+    config = AGSGeneratorConfig.from_env(enable_token2text=_as_bool(data.get("enable_token2text", False)))
     source = AGSPromptSource(args)
     runner = AGSRolloutRunner(args, config)
     remote_buffer_url = data["remote_buffer_url"].rstrip("/") + "/buffer/write"
@@ -235,6 +235,12 @@ def _build_args(data: dict[str, Any]) -> Namespace:
         sglang_router_port=_router_port(data["remote_engine_url"]),
         sglang_tool_call_parser=data.get("sglang_tool_call_parser"),
         sglang_reasoning_parser=data.get("sglang_reasoning_parser"),
+        use_wandb=_as_bool(data.get("use_wandb", False)),
+        wandb_mode=data.get("wandb_mode"),
+        wandb_project=data.get("wandb_project"),
+        wandb_team=data.get("wandb_team"),
+        wandb_run_id=data.get("wandb_run_id"),
+        wandb_group=data.get("wandb_group"),
         sampling_params=sampling_params | {"max_tokens": max_tokens},
     )
 

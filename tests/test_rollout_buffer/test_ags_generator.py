@@ -4,6 +4,9 @@ import asyncio
 import base64
 import json
 import re
+import sys
+import types
+from types import SimpleNamespace
 
 from tests.test_agent._fakes import FakeSandbox
 
@@ -19,6 +22,8 @@ from slime_plugins.rollout_buffer.generator.ags_generator.serialization import (
     output_item_from_samples,
     samples_from_payload,
 )
+from slime_plugins.rollout_buffer.generator.ags_generator.weave_trace import AGSWeaveTrace, iter_trajectory_events
+from slime_plugins.rollout_buffer.rollout_buffer_example import start_rollout
 
 
 def _sample(*, reward=1.0, status=Sample.Status.COMPLETED):
@@ -68,6 +73,225 @@ def test_sampling_params_use_sglang_generate_names():
         "max_new_tokens": 128,
         "temperature": 1.0,
     }
+
+
+class _FakeTokenizer:
+    def __init__(self):
+        self.calls = []
+
+    def decode(self, tokens, skip_special_tokens=False):
+        self.calls.append((tokens, skip_special_tokens))
+        return "|".join(str(token) for token in tokens)
+
+
+class _FakeWeaveClient:
+    def __init__(self):
+        self.created = []
+        self.finished = []
+        self.wandb_contexts = []
+
+    def create_call(self, op, inputs, **kwargs):
+        call = SimpleNamespace(op=op, inputs=inputs, kwargs=kwargs)
+        self.created.append(call)
+        return call
+
+    def finish_call(self, call, output=None, exception=None, **kwargs):
+        self.finished.append((call, output, exception, kwargs))
+
+    def set_wandb_run_context(self, run_id, step=None):
+        self.wandb_contexts.append((run_id, step))
+
+
+def _trace(enable_token2text=False):
+    trace = AGSWeaveTrace(_trace_args(), _FakeTokenizer(), enable_token2text=enable_token2text)
+    trace.client = _FakeWeaveClient()
+    return trace
+
+
+def _trace_args(**overrides):
+    data = {
+        "use_wandb": False,
+        "wandb_mode": None,
+        "wandb_team": "team",
+        "wandb_project": "project",
+        "wandb_run_id": "run-1",
+        "wandb_group": "group-1",
+    }
+    data.update(overrides)
+    return SimpleNamespace(**data)
+
+
+def test_weave_trace_disabled_without_use_wandb(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules, "weave", types.SimpleNamespace(init=lambda project: (_ for _ in ()).throw(AssertionError))
+    )
+
+    trace = AGSWeaveTrace(_trace_args(use_wandb=False, wandb_mode="online"), _FakeTokenizer())
+
+    assert trace.client is None
+
+
+def test_weave_trace_disabled_for_offline_or_disabled_wandb(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules, "weave", types.SimpleNamespace(init=lambda project: (_ for _ in ()).throw(AssertionError))
+    )
+
+    assert AGSWeaveTrace(_trace_args(use_wandb=True, wandb_mode="disabled"), _FakeTokenizer()).client is None
+    assert AGSWeaveTrace(_trace_args(use_wandb=True, wandb_mode="offline"), _FakeTokenizer()).client is None
+
+
+def test_weave_trace_uses_wandb_project_and_run_context(monkeypatch):
+    client = _FakeWeaveClient()
+    seen = {}
+
+    def fake_init(project):
+        seen["project"] = project
+        return client
+
+    monkeypatch.setitem(sys.modules, "weave", types.SimpleNamespace(init=fake_init))
+
+    trace = AGSWeaveTrace(
+        _trace_args(use_wandb=True, wandb_mode="online", wandb_team="entity", wandb_project="train-proj"),
+        _FakeTokenizer(),
+    )
+
+    assert trace.client is client
+    assert seen["project"] == "entity/train-proj"
+    assert client.wandb_contexts == [("run-1", None)]
+
+
+def test_weave_trace_keeps_token_ids_without_decoding_by_default():
+    trace = _trace()
+
+    payload = trace._sample_payload(_sample())
+
+    assert payload["prompt_token_ids"] == [1]
+    assert payload["response_token_ids"] == [2, 3]
+    assert "prompt_text" not in payload
+    assert "response_text" not in payload
+    assert trace.tokenizer.calls == []
+
+
+def test_weave_trace_decodes_prompt_and_response_when_enabled():
+    trace = _trace(enable_token2text=True)
+
+    payload = trace._sample_payload(_sample())
+
+    assert payload["prompt_text"] == "1"
+    assert payload["response_text"] == "2|3"
+    assert trace.tokenizer.calls == [([1], False), ([2, 3], False)]
+
+
+def test_weave_trace_pairs_tool_call_and_result(tmp_path):
+    trajectory = tmp_path / "trajectory.jsonl"
+    trajectory.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "timestamp": "2026-07-13T01:02:03Z",
+                        "message": {
+                            "content": [
+                                {"type": "thinking", "thinking": "inspect"},
+                                {"type": "tool_use", "id": "tool-1", "name": "Read", "input": {"file": "a.py"}},
+                            ]
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "user",
+                        "timestamp": "2026-07-13T01:02:04Z",
+                        "message": {
+                            "content": [{"type": "tool_result", "tool_use_id": "tool-1", "content": "source"}]
+                        },
+                    }
+                ),
+                json.dumps({"type": "stream_event", "event": {"type": "content_block_delta"}}),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    trace = _trace()
+    parent = SimpleNamespace()
+
+    trace._log_trajectory(parent, str(trajectory))
+
+    assert [call.op for call in trace.client.created] == ["slime.ags.thinking", "slime.ags.tool_call"]
+    tool_call = trace.client.created[1]
+    tool_finish = next(item for item in trace.client.finished if item[0] is tool_call)
+    assert tool_call.inputs["input"] == {"file": "a.py"}
+    assert tool_finish[1]["content"] == "source"
+    assert tool_finish[3]["ended_at"].isoformat() == "2026-07-13T01:02:04+00:00"
+    assert len(list(iter_trajectory_events(trajectory))) == 3
+
+
+def test_weave_trace_finishes_root_when_child_logging_fails(monkeypatch):
+    trace = _trace(enable_token2text=True)
+    root = SimpleNamespace()
+
+    def fail_child_logging(parent, trajectory_path):
+        raise RuntimeError("trace backend unavailable")
+
+    monkeypatch.setattr(trace, "_log_trajectory", fail_child_logging)
+    trace.finish_rollout(root, samples=[_sample()], trajectory_path="trajectory.jsonl")
+
+    assert len(trace.client.finished) == 1
+    call, output, exception, _ = trace.client.finished[0]
+    assert call is root
+    assert output == {"trace_output_error": True}
+    assert exception is None
+
+
+def test_start_rollout_forwards_enable_token2text(monkeypatch):
+    captured = {}
+
+    class _Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"message": "Rollout started"}
+
+    def fake_post(url, json, timeout):
+        captured.update(json)
+        return _Response()
+
+    monkeypatch.setattr("slime_plugins.rollout_buffer.rollout_buffer_example.requests.post", fake_post)
+    args = SimpleNamespace(
+        rollout_num_process=1,
+        num_epoch=1,
+        sglang_router_ip="127.0.0.1",
+        sglang_router_port=30000,
+        rollout_buffer_url="http://127.0.0.1:8889",
+        rollout_task_type="ags",
+        prompt_data="smoke.jsonl",
+        n_samples_per_prompt=1,
+        rollout_max_response_len=16,
+        rollout_temperature=1.0,
+        rollout_top_p=1.0,
+        rollout_top_k=-1,
+        hf_checkpoint="model",
+        rollout_batch_size=1,
+        enable_token2text=True,
+        use_wandb=True,
+        wandb_mode="online",
+        wandb_project="train-proj",
+        wandb_team="entity",
+        wandb_run_id="run-1",
+        wandb_group="group-1",
+    )
+
+    start_rollout(args.rollout_buffer_url, args, {})
+
+    assert captured["enable_token2text"] is True
+    assert captured["use_wandb"] is True
+    assert captured["wandb_mode"] == "online"
+    assert captured["wandb_project"] == "train-proj"
+    assert captured["wandb_team"] == "entity"
+    assert captured["wandb_run_id"] == "run-1"
+    assert captured["wandb_group"] == "group-1"
 
 
 def _ctx(workdir="/workspace/repo", sid="sess-1", url="http://host:18001"):

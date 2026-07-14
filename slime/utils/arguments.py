@@ -1409,6 +1409,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default="math",
             )
             parser.add_argument(
+                "--enable-token2text",
+                action="store_true",
+                default=False,
+                help="Decode token IDs to readable text in rollout traces. Disabled by default.",
+            )
+            parser.add_argument(
                 "--loss-mask-type",
                 type=str,
                 default="qwen",

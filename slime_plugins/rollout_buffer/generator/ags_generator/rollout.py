@@ -21,6 +21,7 @@ from .config import AGSGeneratorConfig
 from .harnesses import resolve_agent
 from .sampling import normalize_sampling_params
 from .swe_task import evaluate, get_metadata, git_diff, prepare_workspace
+from .weave_trace import AGSWeaveTrace
 
 logger = logging.getLogger(__name__)
 
@@ -32,21 +33,35 @@ class AGSRolloutRunner:
         self.harness_cls, self.adapter_cls = resolve_agent(self.config.agent_name)
         self.adapter_service = AdapterService(args, self.config, self.adapter_cls)
         self.artifacts = ArtifactWriter(self.config.artifact_dir)
+        self.weave_trace = AGSWeaveTrace(
+            args,
+            self.adapter_service.tokenizer,
+            enable_token2text=self.config.enable_token2text,
+        )
         self._boot_sem = asyncio.Semaphore(self.config.boot_concurrency)
 
     async def generate(self, base_sample: Sample, sampling_params: dict) -> list[Sample]:
         md = get_metadata(base_sample)
         instance_id = md["instance_id"]
-        if not md["image"] or not md["workdir"]:
-            return self._abort_result(base_sample, "missing_image_or_workdir", instance_id)
-
         base_sample = copy.deepcopy(base_sample)
         session_id = _session_id(base_sample, instance_id)
         base_sample.session_id = session_id
         artifact_id = sample_artifact_id(instance_id, base_sample)
         normalized_sampling = normalize_sampling_params(sampling_params)
+        trace_call = self.weave_trace.start_rollout(
+            instance_id=instance_id,
+            session_id=session_id,
+            sample=base_sample,
+            sampling_params=normalized_sampling,
+            agent=self.config.agent_name,
+        )
+        if not md["image"] or not md["workdir"]:
+            samples = self._abort_result(base_sample, "missing_image_or_workdir", instance_id)
+            self.weave_trace.finish_rollout(trace_call, samples=samples)
+            return samples
         t0 = time.time()
         session_opened = False
+        trajectory_path = None
         try:
             self.adapter_service.adapter.open_session(
                 session_id,
@@ -90,7 +105,9 @@ class AGSRolloutRunner:
                     },
                 )
                 if not samples:
-                    return self._abort_result(base_sample, "adapter_session_empty", instance_id)
+                    samples = self._abort_result(base_sample, "adapter_session_empty", instance_id)
+                    self.weave_trace.finish_rollout(trace_call, samples=samples, trajectory_path=trajectory_path)
+                    return samples
 
                 rollout_path = self.artifacts.dump_rollout(
                     {
@@ -130,13 +147,35 @@ class AGSRolloutRunner:
                     elapsed_sec,
                     len(samples),
                 )
+                self.weave_trace.finish_rollout(
+                    trace_call,
+                    samples=samples,
+                    trajectory_path=trajectory_path,
+                    output={
+                        "reward": float(reward),
+                        "applied_cleanly": bool(applied_cleanly),
+                        "agent_exit_code": agent_exit_code,
+                        "elapsed_sec": elapsed_sec,
+                        "patch_path": patch_path,
+                        "rollout_dump_path": rollout_path,
+                    },
+                )
                 return samples
         except asyncio.TimeoutError:
             _log_timeout_diagnostic(t0, instance_id, self.config.rollout_guard_sec)
-            return self._abort_result(base_sample, "wall_clock_timeout", instance_id)
+            samples = self._abort_result(base_sample, "wall_clock_timeout", instance_id)
+            self.weave_trace.finish_rollout(trace_call, samples=samples, trajectory_path=trajectory_path)
+            return samples
         except Exception as exc:
             logger.warning("[ags_generator] %s: rollout failed: %s\n%s", instance_id, exc, traceback.format_exc())
-            return self._abort_result(base_sample, f"exception:{type(exc).__name__}", instance_id)
+            samples = self._abort_result(base_sample, f"exception:{type(exc).__name__}", instance_id)
+            self.weave_trace.finish_rollout(
+                trace_call,
+                samples=samples,
+                trajectory_path=trajectory_path,
+                exception=exc,
+            )
+            return samples
         finally:
             if session_opened:
                 try:

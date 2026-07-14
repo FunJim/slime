@@ -21,10 +21,11 @@ class AGSGeneratorConfig:
     rollout_concurrency: int
     boot_retries: int
     artifact_dir: str | None
+    enable_token2text: bool
     prompt: str
 
     @classmethod
-    def from_env(cls) -> AGSGeneratorConfig:
+    def from_env(cls, *, enable_token2text: bool = False) -> AGSGeneratorConfig:
         agent_time_budget = int(os.environ.get("SWE_AGENT_TIME_BUDGET_SEC", "1800"))
         eval_timeout = int(os.environ.get("SWE_EVAL_TIMEOUT_SEC", "600"))
         guard = int(os.environ.get("SWE_ROLLOUT_GUARD_SEC", "0") or 0) or (agent_time_budget + eval_timeout + 180)
@@ -44,11 +45,9 @@ class AGSGeneratorConfig:
             rollout_concurrency=max(1, rollout_concurrency),
             boot_retries=int(os.environ.get("SWE_BOOT_RETRIES", "2")),
             artifact_dir=os.environ.get("TRAJECTORY_DUMP_DIR", "").strip() or None,
+            enable_token2text=enable_token2text,
             prompt=os.environ.get(
                 "SWE_CC_PROMPT",
-                "Read PROBLEM_STATEMENT.md in the current directory and resolve the issue. "
-                "Edit source files only (do NOT touch tests). After editing, run the relevant "
-                "tests to verify your fix passes. Do NOT modify PROBLEM_STATEMENT.md and do "
-                "NOT commit. When finished, print a one-line summary and exit.",
+                "Read PROBLEM_STATEMENT.md in the current directory and resolve the issue. Edit source files only (do NOT touch tests). After editing, run the relevant tests to verify your fix passes. Do NOT modify PROBLEM_STATEMENT.md and do NOT commit. When finished, print a one-line summary and exit.",
             ),
         )

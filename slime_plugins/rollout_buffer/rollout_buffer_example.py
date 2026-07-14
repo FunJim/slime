@@ -81,7 +81,7 @@ def select_rollout_data(args, results, need_length):
         newest_ts = selected_groups[0][1]
         oldest_ts = selected_groups[-1][1]
         print(
-            f"📈 Selected {len(selected_groups)} groups with {len(selected_results)*args.n_samples_per_prompt} samples"
+            f"📈 Selected {len(selected_groups)} groups with {len(selected_results) * args.n_samples_per_prompt} samples"
         )
         print(f"📈 Group timestamp range: {oldest_ts:.2f} to {newest_ts:.2f}")
         print(f"📈 Time span: {newest_ts - oldest_ts:.2f} seconds")
@@ -327,6 +327,13 @@ def start_rollout(api_base_url: str, args, metadata):
         "rollout_shuffle": getattr(args, "rollout_shuffle", False),
         "sglang_tool_call_parser": getattr(args, "sglang_tool_call_parser", None),
         "sglang_reasoning_parser": getattr(args, "sglang_reasoning_parser", None),
+        "use_wandb": getattr(args, "use_wandb", False),
+        "wandb_mode": getattr(args, "wandb_mode", None),
+        "wandb_project": getattr(args, "wandb_project", None),
+        "wandb_team": getattr(args, "wandb_team", None),
+        "wandb_run_id": getattr(args, "wandb_run_id", None),
+        "wandb_group": getattr(args, "wandb_group", None),
+        "enable_token2text": getattr(args, "enable_token2text", False),
         "skip_instance_ids": finished_groups_instance_id_list,
     }
     print("start rollout with payload: ", payload)
