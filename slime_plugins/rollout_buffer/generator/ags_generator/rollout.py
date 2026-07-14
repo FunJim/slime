@@ -36,6 +36,7 @@ class AGSRolloutRunner:
         self.weave_trace = AGSWeaveTrace(
             args,
             self.adapter_service.tokenizer,
+            agent=self.config.agent_name,
             enable_token2text=self.config.enable_token2text,
         )
         self._boot_sem = asyncio.Semaphore(self.config.boot_concurrency)

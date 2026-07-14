@@ -108,6 +108,12 @@ def _trace(enable_token2text=False):
     return trace
 
 
+def _trace_for_agent(agent):
+    trace = AGSWeaveTrace(_trace_args(), _FakeTokenizer(), agent=agent)
+    trace.client = _FakeWeaveClient()
+    return trace
+
+
 def _trace_args(**overrides):
     data = {
         "use_wandb": False,
@@ -225,6 +231,122 @@ def test_weave_trace_pairs_tool_call_and_result(tmp_path):
     assert tool_finish[1]["content"] == "source"
     assert tool_finish[3]["ended_at"].isoformat() == "2026-07-13T01:02:04+00:00"
     assert len(list(iter_trajectory_events(trajectory))) == 3
+
+
+def test_weave_trace_parses_codebuddy_code_stream_json(tmp_path):
+    trajectory = tmp_path / "trajectory.jsonl"
+    trajectory.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "stream_event",
+                        "event": {"type": "content_block_delta"},
+                        "__timestamp": "2026-07-14T03:24:03.333Z",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "think-1",
+                        "session_id": "sess-cbc",
+                        "message": {
+                            "content": [{"type": "thinking", "thinking": "inspect cbc"}],
+                            "usage": {"input_tokens": 0, "output_tokens": 0},
+                        },
+                        "__timestamp": "2026-07-14T03:24:03.343Z",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "msg-1",
+                        "session_id": "sess-cbc",
+                        "message": {
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": "call-1",
+                                    "name": "Read",
+                                    "input": {"file_path": "/testbed/PROBLEM_STATEMENT.md"},
+                                }
+                            ],
+                            "usage": {"input_tokens": 10, "output_tokens": 2},
+                        },
+                        "__timestamp": "2026-07-14T03:24:03.352Z",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "result-1",
+                        "session_id": "sess-cbc",
+                        "message": {
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "call-1",
+                                    "content": [{"type": "text", "text": "source"}],
+                                    "is_error": False,
+                                }
+                            ]
+                        },
+                        "parent_tool_use_id": "call-1",
+                        "__timestamp": "2026-07-14T03:24:03.379Z",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "result",
+                        "subtype": "success",
+                        "is_error": False,
+                        "result": "done",
+                        "session_id": "sess-cbc",
+                        "__timestamp": "2026-07-14T03:24:04.000Z",
+                    }
+                ),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    trace = _trace_for_agent("codebuddy_code")
+    parent = SimpleNamespace()
+
+    trace._log_trajectory(parent, str(trajectory))
+
+    assert [call.op for call in trace.client.created] == [
+        "slime.ags.thinking",
+        "slime.ags.tool_call",
+        "slime.ags.result",
+    ]
+    thinking, tool_call, result_call = trace.client.created
+    tool_finish = next(item for item in trace.client.finished if item[0] is tool_call)
+    assert thinking.inputs["timestamp"] == "2026-07-14T03:24:03.343Z"
+    assert tool_call.inputs["input"] == {"file_path": "/testbed/PROBLEM_STATEMENT.md"}
+    assert tool_finish[1]["content"] == [{"type": "text", "text": "source"}]
+    assert tool_finish[3]["ended_at"].isoformat() == "2026-07-14T03:24:03.379000+00:00"
+    assert next(item for item in trace.client.finished if item[0] is result_call)[1]["result"] == "done"
+    assert len(list(iter_trajectory_events(trajectory, agent="codebuddy_code"))) == 4
+
+
+def test_weave_trace_codex_parser_placeholder_noops(tmp_path):
+    trajectory = tmp_path / "trajectory.jsonl"
+    trajectory.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "timestamp": "2026-07-13T01:02:03Z",
+                "message": {"content": [{"type": "text", "text": "not parsed yet"}]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    trace = _trace_for_agent("codex")
+
+    trace._log_trajectory(SimpleNamespace(), str(trajectory))
+
+    assert trace.client.created == []
+    assert list(iter_trajectory_events(trajectory, agent="codex")) == []
 
 
 def test_weave_trace_finishes_root_when_child_logging_fails(monkeypatch):
@@ -362,7 +484,7 @@ def test_codebuddy_code_launch_command_and_env(monkeypatch):
 
         assert rc != 0  # time_budget=0 avoids waiting; launch still happens.
         body = next(v for k, v in sb.files.items() if k.endswith("run.sh"))
-        assert "cbc --model slime-actor --output-format json" in body
+        assert "cbc --model slime-actor --verbose --output-format stream-json --include-partial-messages" in body
         assert "--max-turns 7" in body
         assert "-y" in body and "solve it" in body
         assert "--effort none" in body
