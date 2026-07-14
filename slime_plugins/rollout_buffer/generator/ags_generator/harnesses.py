@@ -202,7 +202,9 @@ class CodeBuddyCodeHarness(BaseHarness):
     async def launch_and_wait(self, sb: Sandbox, ctx: HarnessContext, prompt: str, time_budget_sec: int) -> int:
         parts: list[str] = [
             f"--model {shlex.quote(ctx.model_label)}",
-            "--output-format json",
+            "--verbose",
+            "--output-format stream-json",
+            "--include-partial-messages",
         ]
         tools = os.environ.get(self.tools_env, ",".join(self.allowed_tools)).strip()
         if tools:
