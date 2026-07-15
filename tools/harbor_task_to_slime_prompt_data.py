@@ -37,7 +37,9 @@ Example:
 from __future__ import annotations
 
 import argparse
+import base64
 import fnmatch
+import gzip
 import json
 import os
 import re
@@ -370,7 +372,8 @@ def build_eval_cmd(task_dir: Path, swe_config: dict[str, Any]) -> str:
     The embedded files intentionally use Harbor's canonical absolute paths
     (/tests/config.json, /tests/test.sh, and /logs/verifier) instead of /tmp
     paths because Harbor-generated tests/test.sh and downstream tooling expect
-    that layout.
+    that layout. The payloads are gzip+base64 encoded so large SWE-bench
+    PASS_TO_PASS lists do not make the shell command exceed AGS/E2B argv limits.
     """
     test_script_path = task_dir / "tests" / "test.sh"
     if not test_script_path.is_file():
@@ -379,7 +382,23 @@ def build_eval_cmd(task_dir: Path, swe_config: dict[str, Any]) -> str:
     config_path = "/tests/config.json"
     script_path = "/tests/test.sh"
     test_script = test_script_path.read_text()
-    config_json = json.dumps(swe_config, ensure_ascii=False, indent=2)
+    config_json = json.dumps(swe_config, ensure_ascii=False, separators=(",", ":"))
+    config_payload = _gzip_base64(config_json)
+    test_payload = _gzip_base64(test_script)
+    decoder_delim = f"SLIME_AGS_DECODE_{task_slug}"
+    decoder = "\n".join(
+        [
+            "import base64, gzip, pathlib",
+            f"paths = [{config_path!r}, {script_path!r}]",
+            "payloads = [",
+            repr(config_payload),
+            ",",
+            repr(test_payload),
+            "]",
+            "for path, payload in zip(paths, payloads):",
+            "    pathlib.Path(path).write_bytes(gzip.decompress(base64.b64decode(payload)))",
+        ]
+    )
     return "\n".join(
         [
             "set -euo pipefail",
@@ -387,8 +406,7 @@ def build_eval_cmd(task_dir: Path, swe_config: dict[str, Any]) -> str:
             # them here so they exist only in the eval sandbox, not in the
             # agent sandbox.
             "mkdir -p /tests /logs/verifier",
-            _heredoc(config_path, config_json, f"SLIME_AGS_CONFIG_{task_slug}"),
-            _heredoc(script_path, test_script, f"SLIME_AGS_TEST_{task_slug}"),
+            _python_heredoc(decoder, decoder_delim),
             f"chmod +x {shlex.quote(script_path)}",
             f"bash {shlex.quote(script_path)}",
         ]
@@ -592,6 +610,16 @@ def _heredoc(path: str, content: str, delimiter: str) -> str:
     while delimiter in content:
         delimiter += "_END"
     return f"cat > {shlex.quote(path)} <<'{delimiter}'\n{content.rstrip()}\n{delimiter}"
+
+
+def _gzip_base64(content: str) -> str:
+    return base64.b64encode(gzip.compress(content.encode("utf-8"))).decode("ascii")
+
+
+def _python_heredoc(script: str, delimiter: str) -> str:
+    while delimiter in script:
+        delimiter += "_END"
+    return f"python3 - <<'{delimiter}'\n{script.rstrip()}\n{delimiter}"
 
 
 def _drop_none(data: dict[str, Any]) -> dict[str, Any]:
