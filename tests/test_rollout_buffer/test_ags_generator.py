@@ -12,6 +12,7 @@ from tests.test_agent._fakes import FakeSandbox
 
 from slime.utils.types import Sample
 from slime_plugins.rollout_buffer.generator.ags_generator.entry import (
+    _collapse_eval_samples,
     get_group_data_meta_info,
     is_valid_group,
     transform_group,
@@ -66,6 +67,34 @@ def test_group_hooks_accept_complete_sample_payloads():
     assert meta["avg_reward"] == 1.0
     assert meta["nonzero_reward_samples"] == 1
     assert meta["artifact_counts"] == {"trajectory": 1, "patch": 1, "rollout_dump": 1, "complete": 1}
+
+
+def test_eval_collapse_keeps_one_scored_sample_per_attempt():
+    base = Sample(index=7, prompt="p", metadata={"dataset": "eval"})
+    segments = [
+        _sample(reward=1.0),
+        _sample(reward=1.0),
+    ]
+    segments[0].metadata = {**segments[0].metadata, "instance_id": "inst-1"}
+
+    collapsed = _collapse_eval_samples(base, segments)
+
+    assert collapsed.reward == 1.0
+    assert collapsed.status == Sample.Status.COMPLETED
+    assert collapsed.remove_sample is True
+    assert collapsed.tokens == [0, 0]
+    assert collapsed.response_length == 1
+    assert collapsed.metadata["dataset"] == "eval"
+    assert collapsed.metadata["instance_id"] == "inst-1"
+    assert collapsed.metadata["eval_collapsed_segments"] == 2
+
+
+def test_eval_collapse_marks_empty_output_aborted():
+    collapsed = _collapse_eval_samples(Sample(index=7, metadata={"dataset": "eval"}), [])
+
+    assert collapsed.reward == 0.0
+    assert collapsed.status == Sample.Status.ABORTED
+    assert collapsed.metadata["eval_collapsed_segments"] == 0
 
 
 def test_sampling_params_use_sglang_generate_names():

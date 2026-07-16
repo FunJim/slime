@@ -2,6 +2,7 @@
 
 from slime_plugins.rollout_buffer.generator.ags_generator.entry import (  # noqa: F401
     TASK_TYPE,
+    generate,
     get_group_data_meta_info,
     is_valid_group,
     run_rollout,

@@ -1,5 +1,5 @@
 """AGS coding-agent rollout-buffer generator package."""
 
-from .entry import TASK_TYPE, run_rollout
+from .entry import TASK_TYPE, generate, run_rollout
 
-__all__ = ["TASK_TYPE", "run_rollout"]
+__all__ = ["TASK_TYPE", "run_rollout", "generate"]

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 from argparse import Namespace
 from typing import Any
 
 import requests
 
+from slime.utils.misc import SingletonMeta
 from slime.utils.types import Sample
 
 from .config import AGSGeneratorConfig
@@ -19,6 +21,50 @@ from .source import AGSPromptSource
 TASK_TYPE = "ags"
 
 logger = logging.getLogger(__name__)
+
+
+class _AGSGenerateState(metaclass=SingletonMeta):
+    """Process-local state for the per-sample AGS generate hook.
+
+    The default slime eval loop calls the custom generate function once per
+    sample. Keep the runner and concurrency semaphore process-local so periodic
+    eval reuses the same adapter service instead of rebuilding it for every
+    prompt.
+    """
+
+    def __init__(self, args: Namespace) -> None:
+        self.config = AGSGeneratorConfig.from_env(
+            enable_token2text=_as_bool(getattr(args, "enable_token2text", False))
+        )
+        self.runner = AGSRolloutRunner(args, self.config)
+        self.semaphore = asyncio.Semaphore(self.config.rollout_concurrency)
+
+
+async def generate(
+    args: Namespace,
+    base_sample: Sample,
+    sampling_params: dict[str, Any],
+    evaluation: bool = False,
+) -> list[Sample]:
+    """Generate one AGS rollout for slime's default rollout/eval loop.
+
+    This hook lets periodic eval use the AGS runner via:
+
+      --eval-function-path slime.rollout.sglang_rollout.generate_rollout
+      --custom-generate-function-path slime_plugins.rollout_buffer.generator.ags_generator.generate
+
+    Training keeps AGSRolloutRunner's trainable segment output. Eval collapses
+    the possibly multi-segment trajectory into one scored sample so pass-rate
+    metrics count one eval attempt per prompt.
+    """
+
+    state = _AGSGenerateState(args)
+    async with state.semaphore:
+        samples = await state.runner.generate(base_sample, sampling_params)
+
+    if not evaluation:
+        return samples
+    return [_collapse_eval_samples(base_sample, samples)]
 
 
 def run_rollout(data: dict[str, Any]) -> str:
@@ -104,6 +150,28 @@ def run_rollout(data: dict[str, Any]) -> str:
         skip_instance_ids = []
         asyncio.run(_run_epoch(epoch, samples))
     return "finished"
+
+
+def _collapse_eval_samples(base_sample: Sample, samples: list[Sample]) -> Sample:
+    """Return a single eval Sample from AGSRolloutRunner's segment output."""
+
+    sample = copy.deepcopy(base_sample)
+    first = samples[0] if samples else None
+    metadata = dict(getattr(sample, "metadata", None) or {})
+    if first is not None:
+        metadata.update(first.metadata or {})
+    metadata["eval_collapsed_segments"] = len(samples)
+
+    sample.tokens = [0, 0]
+    sample.response = ""
+    sample.response_length = 1
+    sample.loss_mask = [0]
+    sample.rollout_log_probs = [0.0]
+    sample.reward = 0.0 if first is None or first.reward is None else float(first.reward)
+    sample.remove_sample = True
+    sample.status = Sample.Status.ABORTED if first is None else first.status
+    sample.metadata = metadata
+    return sample
 
 
 def transform_group(group, task_type: str = TASK_TYPE):
