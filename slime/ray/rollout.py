@@ -721,6 +721,11 @@ class RolloutManager:
             "truncated": [1 if sample.status == Sample.Status.TRUNCATED else 0 for sample in samples],
             "sample_indices": [sample.index for sample in samples],
             "rollout_ids": rollout_ids,
+            "raw_reward_group_indices": [
+                sample.group_index if sample.group_index is not None else i // self.args.n_samples_per_prompt
+                for i, sample in enumerate(samples)
+            ],
+            "raw_reward_rollout_ids": rollout_ids,
         }
 
         # loss mask
@@ -860,7 +865,7 @@ class RolloutManager:
                     continue
                 rollout_data[key] = [data[key][j] for j in partition]
             # keys that need to be splited at train side
-            for key in ["raw_reward", "total_lengths"]:
+            for key in ["raw_reward", "raw_reward_group_indices", "raw_reward_rollout_ids", "total_lengths"]:
                 if key not in data:
                     continue
                 rollout_data[key] = data[key]
