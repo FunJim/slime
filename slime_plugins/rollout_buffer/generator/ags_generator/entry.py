@@ -78,9 +78,11 @@ def run_rollout(data: dict[str, Any]) -> str:
     remote_buffer_url = data["remote_buffer_url"].rstrip("/") + "/buffer/write"
     num_epoch = int(data.get("num_epoch", 1))
     groups_per_epoch = int(
-        data.get("rollout_batch_size") or data.get("num_groups_per_epoch") or args.rollout_batch_size
+        data.get("num_groups_per_epoch") or data.get("rollout_batch_size") or args.rollout_batch_size
     )
     skip_instance_ids = data.get("skip_instance_ids") or []
+    stop_event = data.get("_stop_event")
+    rollout_job_id = data.get("_rollout_job_id")
 
     logger.info(
         "[ags_generator] start task_type=%s groups_per_epoch=%s repeats=%s epochs=%s concurrency=%s buffer=%s",
@@ -106,49 +108,88 @@ def run_rollout(data: dict[str, Any]) -> str:
                 **(first.metadata or {}),
             },
         )
+        if rollout_job_id is not None:
+            item["rollout_job_id"] = rollout_job_id
         await asyncio.to_thread(_send_data_to_buffer, remote_buffer_url, item)
 
     async def _run_epoch(epoch: int, samples: list[Sample]) -> None:
-        semaphore = asyncio.Semaphore(config.rollout_concurrency)
-
         async def _guarded(sample: Sample) -> None:
-            async with semaphore:
+            try:
+                await _run_sample(epoch, sample)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                instance_id = _instance_id(sample)
+                logger.exception(
+                    "[ags_generator] %s: sample task failed; writing aborted rollout: %s",
+                    instance_id,
+                    exc,
+                )
+                outputs = runner._abort_result(sample, f"task_exception:{type(exc).__name__}", instance_id)
+                first = outputs[0]
+                item = output_item_from_samples(
+                    outputs,
+                    instance_id=instance_id,
+                    extra_info={
+                        "epoch": epoch,
+                        "task_type": TASK_TYPE,
+                        "reward": first.reward,
+                        **(first.metadata or {}),
+                    },
+                )
+                if rollout_job_id is not None:
+                    item["rollout_job_id"] = rollout_job_id
                 try:
-                    await _run_sample(epoch, sample)
-                except Exception as exc:
-                    instance_id = _instance_id(sample)
+                    await asyncio.to_thread(_send_data_to_buffer, remote_buffer_url, item)
+                except Exception as send_exc:
                     logger.exception(
-                        "[ags_generator] %s: sample task failed; writing aborted rollout: %s",
+                        "[ags_generator] %s: failed to write aborted rollout after task failure: %s",
                         instance_id,
-                        exc,
+                        send_exc,
                     )
-                    outputs = runner._abort_result(sample, f"task_exception:{type(exc).__name__}", instance_id)
-                    first = outputs[0]
-                    item = output_item_from_samples(
-                        outputs,
-                        instance_id=instance_id,
-                        extra_info={
-                            "epoch": epoch,
-                            "task_type": TASK_TYPE,
-                            "reward": first.reward,
-                            **(first.metadata or {}),
-                        },
-                    )
-                    try:
-                        await asyncio.to_thread(_send_data_to_buffer, remote_buffer_url, item)
-                    except Exception as send_exc:
-                        logger.exception(
-                            "[ags_generator] %s: failed to write aborted rollout after task failure: %s",
-                            instance_id,
-                            send_exc,
-                        )
 
-        await asyncio.gather(*(_guarded(sample) for sample in samples))
+        pending: set[asyncio.Task[None]] = set()
+        sample_iter = iter(samples)
+        exhausted = False
+
+        while pending or not exhausted:
+            while not exhausted and len(pending) < config.rollout_concurrency and not _stop_requested(stop_event):
+                try:
+                    sample = next(sample_iter)
+                except StopIteration:
+                    exhausted = True
+                    break
+                pending.add(asyncio.create_task(_guarded(sample)))
+
+            if not pending:
+                break
+
+            done, pending = await asyncio.wait(pending, timeout=1.0, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                task.result()
+
+            if _stop_requested(stop_event):
+                logger.info(
+                    "[ags_generator] stop requested; cancelling %d in-flight tasks for epoch %d",
+                    len(pending),
+                    epoch,
+                )
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                pending.clear()
+                break
 
     for epoch in range(num_epoch):
+        if _stop_requested(stop_event):
+            logger.info("[ags_generator] stop requested before epoch %d; exiting", epoch)
+            break
         samples = source.get_repeated_samples(groups_per_epoch, skip_instance_ids=skip_instance_ids)
         skip_instance_ids = []
         asyncio.run(_run_epoch(epoch, samples))
+        if _stop_requested(stop_event):
+            logger.info("[ags_generator] stop requested after epoch %d; exiting", epoch)
+            break
     return "finished"
 
 
@@ -353,3 +394,7 @@ def _as_bool(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "y", "on"}
     return bool(value)
+
+
+def _stop_requested(stop_event: Any) -> bool:
+    return bool(stop_event is not None and stop_event.is_set())

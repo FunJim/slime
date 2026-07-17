@@ -436,6 +436,8 @@ def test_start_rollout_forwards_enable_token2text(monkeypatch):
 
     start_rollout(args.rollout_buffer_url, args, {})
 
+    assert captured["num_epoch"] == "1"
+    assert captured["num_groups_per_epoch"] == "1"
     assert captured["enable_token2text"] is True
     assert captured["use_wandb"] is True
     assert captured["wandb_mode"] == "online"
@@ -443,6 +445,62 @@ def test_start_rollout_forwards_enable_token2text(monkeypatch):
     assert captured["wandb_team"] == "entity"
     assert captured["wandb_run_id"] == "run-1"
     assert captured["wandb_group"] == "group-1"
+
+
+def test_start_rollout_uses_one_buffer_epoch_even_when_trainer_num_epoch_is_larger(monkeypatch):
+    captured = {}
+
+    class _Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"message": "Rollout started"}
+
+    def fake_post(url, json, timeout):
+        captured.update(json)
+        return _Response()
+
+    monkeypatch.setattr("slime_plugins.rollout_buffer.rollout_buffer_example.requests.post", fake_post)
+    args = SimpleNamespace(
+        rollout_num_process=1,
+        num_epoch=3,
+        sglang_router_ip="127.0.0.1",
+        sglang_router_port=30000,
+        rollout_buffer_url="http://127.0.0.1:8889",
+        rollout_task_type="ags",
+        prompt_data="smoke.jsonl",
+        n_samples_per_prompt=4,
+        rollout_max_response_len=16,
+        rollout_temperature=1.0,
+        rollout_top_p=1.0,
+        rollout_top_k=-1,
+        hf_checkpoint="model",
+        rollout_batch_size=8,
+    )
+
+    start_rollout(args.rollout_buffer_url, args, {}, num_groups_per_epoch=2)
+
+    assert captured["num_epoch"] == "1"
+    assert captured["num_groups_per_epoch"] == "2"
+
+
+def test_rollout_buffer_ignores_stale_ags_job_items():
+    from slime_plugins.rollout_buffer.buffer import RolloutBuffer
+
+    current = output_item_from_samples([_sample()], instance_id="inst-1")
+    current["rollout_job_id"] = "job-current"
+    stale = output_item_from_samples([_sample()], instance_id="inst-2")
+    stale["rollout_job_id"] = "job-stale"
+
+    buffer = RolloutBuffer(group_size=1, rollout_job_id="job-current")
+
+    assert buffer.write(stale) is None
+    assert buffer.write(current) == current
+
+    data = buffer.read()["data"]
+    assert len(data) == 1
+    assert data[0]["instance_id"] == "inst-1"
 
 
 def _ctx(workdir="/workspace/repo", sid="sess-1", url="http://host:18001"):

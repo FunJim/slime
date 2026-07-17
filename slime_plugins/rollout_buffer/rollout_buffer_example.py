@@ -16,7 +16,6 @@ __all__ = ["generate_rollout"]
 
 # Global variables for evaluation
 TOKENIZER = None
-START_ROLLOUT = True
 
 
 def select_rollout_data(args, results, need_length):
@@ -295,13 +294,20 @@ async def get_rollout_data(api_base_url: str) -> tuple[list[dict[str, Any]], dic
         return data, meta_info
 
 
-def start_rollout(api_base_url: str, args, metadata):
+def start_rollout(api_base_url: str, args, metadata, num_groups_per_epoch: int | None = None):
     url = f"{api_base_url}/start_rollout"
     print(f"metadata: {metadata}")
     finished_groups_instance_id_list = [item for sublist in metadata.values() for item in sublist]
+    rollout_buffer_num_epoch = int(getattr(args, "rollout_buffer_num_epoch", 1) or 1)
+    groups_per_epoch = int(num_groups_per_epoch or args.rollout_batch_size)
     payload = {
         "num_process": str(getattr(args, "rollout_num_process", 100)),
-        "num_epoch": str(args.num_epoch or 3),
+        # This is the generator-side epoch count for one rollout-buffer request,
+        # not slime's trainer --num-epoch. Keeping it at 1 prevents the
+        # background AGS job from continuing to call SGLang after this training
+        # rollout has already returned and the colocated engine is offloaded.
+        "num_epoch": str(rollout_buffer_num_epoch),
+        "num_groups_per_epoch": str(groups_per_epoch),
         "remote_engine_url": f"http://{args.sglang_router_ip}:{args.sglang_router_port}",
         "remote_buffer_url": args.rollout_buffer_url,
         "task_type": args.rollout_task_type,
@@ -347,20 +353,28 @@ def start_rollout(api_base_url: str, args, metadata):
             return data
         except Exception as e:
             print(f"[start_rollout] Failed to send rollout config: {e}")
+            time.sleep(3)
+
+
+def stop_rollout(api_base_url: str, timeout_sec: float = 120.0) -> dict[str, Any]:
+    url = f"{api_base_url}/stop_rollout"
+    resp = requests.post(
+        url,
+        json={"wait": True, "timeout_sec": timeout_sec},
+        timeout=timeout_sec + 10,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    print(f"[stop_rollout] {data}")
+    if not data.get("stopped", False):
+        raise RuntimeError(f"rollout background job did not stop within {timeout_sec}s: {data}")
+    return data
 
 
 async def generate_rollout_async(args, rollout_id: int, data_buffer, evaluation: bool = False) -> dict[str, Any]:
 
-    global START_ROLLOUT
     if evaluation:
         raise NotImplementedError("Evaluation rollout is not implemented")
-
-    if START_ROLLOUT:
-        metadata = data_buffer.get_metadata()
-        start_inform = start_rollout(args.rollout_buffer_url, args, metadata)
-        print(f"start rollout with payload: {start_inform}")
-        print(f"start rollout id: {rollout_id}")
-        START_ROLLOUT = False
 
     data_number_to_fetch = args.rollout_batch_size * args.n_samples_per_prompt - data_buffer.get_buffer_length()
     if data_number_to_fetch <= 0:
@@ -371,85 +385,99 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer, evaluation:
     assert (
         data_number_to_fetch % args.n_samples_per_prompt == 0
     ), "data_number_to_fetch must be a multiple of n_samples_per_prompt"
-    print(f"INFO: buffer length: {data_buffer.get_buffer_length()}, data_number_to_fetch: {data_number_to_fetch}")
-    base_url = args.rollout_buffer_url
-    tokenizer = AutoTokenizer.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
-    retry_times = 0
-    results = []
-    all_meta_info = []
 
-    if args.fetch_trajectory_retry_times == -1:
-        print(
-            "⚠️  [get_rollout_data] Fetch trajectory retry times set to -1, will retry indefinitely until sufficient data is collected"
-        )
-    while args.fetch_trajectory_retry_times == -1 or retry_times < args.fetch_trajectory_retry_times:
-        try:
-            while len(results) < data_number_to_fetch:
-                time.sleep(5)
-                data, meta_info = await get_rollout_data(api_base_url=base_url)
-                results.extend(data)
-                if meta_info:
-                    all_meta_info.append(meta_info)
-                print(f"get rollout data with length: {len(results)}")
-            break
-        except Exception as err:
-            print(f"[get_rollout_data] Failed to get rollout data: {err}, retry times: {retry_times}")
-            retry_times += 1
+    groups_to_fetch = data_number_to_fetch // args.n_samples_per_prompt
+    rollout_started = False
+    try:
+        metadata = data_buffer.get_metadata()
+        start_inform = start_rollout(args.rollout_buffer_url, args, metadata, num_groups_per_epoch=groups_to_fetch)
+        print(f"start rollout with payload: {start_inform}")
+        print(f"start rollout id: {rollout_id}")
+        rollout_started = True
 
-    log_raw_info(args, all_meta_info, rollout_id)
+        print(f"INFO: buffer length: {data_buffer.get_buffer_length()}, data_number_to_fetch: {data_number_to_fetch}")
+        base_url = args.rollout_buffer_url
+        tokenizer = AutoTokenizer.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
+        retry_times = 0
+        results = []
+        all_meta_info = []
 
-    # Apply group-based data selection if there are too many samples
-    results = select_rollout_data(args, results, data_number_to_fetch // args.n_samples_per_prompt)
-
-    if len(all_meta_info) > 0 and "finished_groups" in all_meta_info[0]:
-        finished_groups_instance_id_list = []
-        for item in all_meta_info:
-            finished_groups_instance_id_list.extend(item["finished_groups"])
-
-        data_buffer.update_metadata({str(rollout_id): finished_groups_instance_id_list})
-
-    print("finally get rollout data with length: ", len(results))
-    sample_results = []
-
-    for _i, group_record in enumerate(results):
-        group_results = []
-        for record in group_record:
-            if "samples" in record:
-                compact_samples = [Sample.from_dict(item) for item in record["samples"]]
-                group_results.append(compact_samples)
-                continue
-
-            oai_messages = record["messages"]
-
-            mask_generator = MultiTurnLossMaskGenerator(tokenizer, tokenizer_type=args.loss_mask_type)
-            token_ids, loss_mask = mask_generator.get_loss_mask(oai_messages)
-            response_length = mask_generator.get_response_lengths([loss_mask])[0]
-
-            loss_mask = loss_mask[-response_length:]
-
-            group_results.append(
-                Sample(
-                    index=record["instance_id"],
-                    prompt=record["uid"],
-                    tokens=token_ids,
-                    response_length=response_length,
-                    reward=record["reward"],
-                    status=(
-                        Sample.Status.COMPLETED
-                        if "finish_reason" not in record["extra_info"]
-                        or record["extra_info"]["finish_reason"] != "length"
-                        else Sample.Status.TRUNCATED
-                    ),
-                    loss_mask=loss_mask,
-                    metadata={**record["extra_info"]},
-                )
+        if args.fetch_trajectory_retry_times == -1:
+            print(
+                "⚠️  [get_rollout_data] Fetch trajectory retry times set to -1, will retry indefinitely until sufficient data is collected"
             )
-        sample_results.append(group_results)
+        while args.fetch_trajectory_retry_times == -1 or retry_times < args.fetch_trajectory_retry_times:
+            try:
+                while len(results) < data_number_to_fetch:
+                    time.sleep(5)
+                    data, meta_info = await get_rollout_data(api_base_url=base_url)
+                    results.extend(data)
+                    if meta_info:
+                        all_meta_info.append(meta_info)
+                    print(f"get rollout data with length: {len(results)}")
+                break
+            except Exception as err:
+                print(f"[get_rollout_data] Failed to get rollout data: {err}, retry times: {retry_times}")
+                retry_times += 1
 
-    data_buffer.add_samples(sample_results)
-    final_return_results = data_buffer.get_samples(args.rollout_batch_size)  # type: ignore
+        log_raw_info(args, all_meta_info, rollout_id)
 
-    return final_return_results
+        # Apply group-based data selection if there are too many samples
+        results = select_rollout_data(args, results, data_number_to_fetch // args.n_samples_per_prompt)
+
+        if len(all_meta_info) > 0 and "finished_groups" in all_meta_info[0]:
+            finished_groups_instance_id_list = []
+            for item in all_meta_info:
+                finished_groups_instance_id_list.extend(item["finished_groups"])
+
+            data_buffer.update_metadata({str(rollout_id): finished_groups_instance_id_list})
+
+        print("finally get rollout data with length: ", len(results))
+        sample_results = []
+
+        for _i, group_record in enumerate(results):
+            group_results = []
+            for record in group_record:
+                if "samples" in record:
+                    compact_samples = [Sample.from_dict(item) for item in record["samples"]]
+                    group_results.append(compact_samples)
+                    continue
+
+                oai_messages = record["messages"]
+
+                mask_generator = MultiTurnLossMaskGenerator(tokenizer, tokenizer_type=args.loss_mask_type)
+                token_ids, loss_mask = mask_generator.get_loss_mask(oai_messages)
+                response_length = mask_generator.get_response_lengths([loss_mask])[0]
+
+                loss_mask = loss_mask[-response_length:]
+
+                group_results.append(
+                    Sample(
+                        index=record["instance_id"],
+                        prompt=record["uid"],
+                        tokens=token_ids,
+                        response_length=response_length,
+                        reward=record["reward"],
+                        status=(
+                            Sample.Status.COMPLETED
+                            if "finish_reason" not in record["extra_info"]
+                            or record["extra_info"]["finish_reason"] != "length"
+                            else Sample.Status.TRUNCATED
+                        ),
+                        loss_mask=loss_mask,
+                        metadata={**record["extra_info"]},
+                    )
+                )
+            sample_results.append(group_results)
+
+        data_buffer.add_samples(sample_results)
+        final_return_results = data_buffer.get_samples(args.rollout_batch_size)  # type: ignore
+
+        return final_return_results
+    finally:
+        if rollout_started:
+            timeout_sec = float(getattr(args, "rollout_buffer_stop_timeout_sec", 120.0))
+            await asyncio.to_thread(stop_rollout, args.rollout_buffer_url, timeout_sec)
 
 
 def generate_rollout(args, rollout_id, data_buffer, evaluation=False):

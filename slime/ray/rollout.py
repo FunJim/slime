@@ -566,8 +566,14 @@ class RolloutManager:
 
     def offload(self):
         self.health_monitoring_pause()
+        handles = []
         for srv in self.servers.values():
-            srv.offload()
+            for group in srv.server_groups:
+                handles.extend(group.offload())
+        if handles:
+            logger.info("Waiting for %d rollout engine offload requests to finish.", len(handles))
+            return ray.get(handles)
+        return []
 
     def onload(self, tags: list[str] | None = None):
         for srv in self.servers.values():
