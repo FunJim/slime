@@ -26,8 +26,12 @@ class AdapterService(metaclass=SingletonMeta):
             or os.environ.get("AGS_GENERATOR_SGLANG_URL")
             or f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
         )
-        if not config.adapter_public_host:
-            raise RuntimeError("ADAPTER_PUBLIC_HOST is not set; AGS sandboxes need it to reach the adapter")
+        public_base_url = (os.environ.get("ADAPTER_PUBLIC_BASE_URL") or "").strip().rstrip("/")
+        if not public_base_url and not config.adapter_public_host:
+            raise RuntimeError(
+                "ADAPTER_PUBLIC_HOST or ADAPTER_PUBLIC_BASE_URL is not set; "
+                "AGS sandboxes need it to reach the adapter"
+            )
 
         self.adapter = adapter_cls(
             tokenizer=self.tokenizer,
@@ -43,7 +47,7 @@ class AdapterService(metaclass=SingletonMeta):
             thread_name="ags-rollout-adapter",
             runner_kwargs={"handler_cancellation": True, "access_log_class": FilteredAccessLogger},
         )
-        self.adapter_url = f"http://{config.adapter_public_host}:{self.app_handle.port}"
+        self.adapter_url = public_base_url or f"http://{config.adapter_public_host}:{self.app_handle.port}"
         logger.info(
             "[ags_generator] tokenizer=%s adapter=%s sglang_url=%s max_context_len=%s tool_parser=%s reasoning_parser=%s",
             args.hf_checkpoint,
