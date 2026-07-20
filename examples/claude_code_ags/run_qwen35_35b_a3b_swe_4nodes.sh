@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # End-to-end SWE coding-agent RL with Claude Code on AGS, using rollout_buffer
-# on a 2-node Ray cluster. Run from a long-lived shell / tmux session on the
+# on a 4-node Ray cluster. Run from a long-lived shell / tmux session on the
 # Ray head node.
 
 # Best-effort cleanup so a rerun does not collide with stale workers/services.
@@ -22,7 +22,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 SLIME_DIR="${SLIME_DIR:-/data_train/ericxjzheng/workspace/slime}"
 
 # ============ cluster size ============
-ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-${MLP_WORKER_NUM:-2}}"
+ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-${MLP_WORKER_NUM:-4}}"
 ACTOR_NUM_GPUS_PER_NODE="${ACTOR_NUM_GPUS_PER_NODE:-8}"
 TOTAL_NUM_GPUS=$((ACTOR_NUM_NODES * ACTOR_NUM_GPUS_PER_NODE))
 
@@ -36,7 +36,7 @@ export ETP_SIZE="${ETP_SIZE:-1}"
 # ============ rollout engine ============
 ROLLOUT_NUM_GPUS="${ROLLOUT_NUM_GPUS:-${TOTAL_NUM_GPUS}}"
 ROLLOUT_TP_SIZE="${ROLLOUT_TP_SIZE:-8}"
-ROLLOUT_DP_SIZE="${ROLLOUT_DP_SIZE:-2}"
+ROLLOUT_DP_SIZE="${ROLLOUT_DP_SIZE:-4}"
 ROLLOUT_EP_SIZE="${ROLLOUT_EP_SIZE:-8}"
 ROLLOUT_MEM_UTILIZATION="${ROLLOUT_MEM_UTILIZATION:-0.75}"
 NUM_ROLLOUT="${NUM_ROLLOUT:-100}"
@@ -62,7 +62,7 @@ HF_CHECKPOINT="${HF_CHECKPOINT:-/data_train/ericxjzheng/models/Qwen3.5-35B-A3B}"
 REF_MODEL_PATH="${REF_MODEL_PATH:-/data_train/ericxjzheng/models/Qwen3.5-35B-A3B_torch_dist}"
 PROMPT_DATA="${PROMPT_DATA:-/data_train/ericxjzheng/data/SWE-rebench-filtered/filtered.jsonl}"
 
-EXP_TAG="${EXP_TAG:-claude_code_ags_qwen35_35b_a3b_2nodes}"
+EXP_TAG="${EXP_TAG:-claude_code_ags_qwen35_35b_a3b_4nodes}"
 STAMP="$(date +%Y%m%d_%H%M%S)"
 RUN_ROOT="${RUN_ROOT:-${EXP}/runs/${EXP_TAG}_${STAMP}}"
 
