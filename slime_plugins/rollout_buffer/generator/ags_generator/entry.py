@@ -339,6 +339,7 @@ def _build_args(data: dict[str, Any]) -> Namespace:
         dump_details=None,
         rollout_max_context_len=int(data.get("rollout_max_context_len", 0) or 0),
         rollout_batch_size=int(data.get("rollout_batch_size", 1)),
+        rollout_start_group=int(data.get("rollout_start_group", 0) or 0),
         n_samples_per_prompt=int(data["num_repeat_per_sample"]),
         sglang_router_ip=_router_ip(data["remote_engine_url"]),
         sglang_router_port=_router_port(data["remote_engine_url"]),

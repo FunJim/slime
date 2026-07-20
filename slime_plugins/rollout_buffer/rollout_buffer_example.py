@@ -294,7 +294,7 @@ async def get_rollout_data(api_base_url: str) -> tuple[list[dict[str, Any]], dic
         return data, meta_info
 
 
-def start_rollout(api_base_url: str, args, metadata, num_groups_per_epoch: int | None = None):
+def start_rollout(api_base_url: str, args, metadata, num_groups_per_epoch: int | None = None, rollout_id: int = 0):
     url = f"{api_base_url}/start_rollout"
     print(f"metadata: {metadata}")
     finished_groups_instance_id_list = [item for sublist in metadata.values() for item in sublist]
@@ -328,6 +328,8 @@ def start_rollout(api_base_url: str, args, metadata, num_groups_per_epoch: int |
         "apply_chat_template": getattr(args, "apply_chat_template", False),
         "apply_chat_template_kwargs": getattr(args, "apply_chat_template_kwargs", {}) or {},
         "rollout_batch_size": args.rollout_batch_size,
+        "rollout_id": int(rollout_id),
+        "rollout_start_group": int(rollout_id) * int(args.rollout_batch_size),
         "rollout_max_context_len": getattr(args, "rollout_max_context_len", 0),
         "rollout_seed": getattr(args, "rollout_seed", 42),
         "rollout_shuffle": getattr(args, "rollout_shuffle", False),
@@ -390,7 +392,9 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer, evaluation:
     rollout_started = False
     try:
         metadata = data_buffer.get_metadata()
-        start_inform = start_rollout(args.rollout_buffer_url, args, metadata, num_groups_per_epoch=groups_to_fetch)
+        start_inform = start_rollout(
+            args.rollout_buffer_url, args, metadata, num_groups_per_epoch=groups_to_fetch, rollout_id=rollout_id
+        )
         print(f"start rollout with payload: {start_inform}")
         print(f"start rollout id: {rollout_id}")
         rollout_started = True

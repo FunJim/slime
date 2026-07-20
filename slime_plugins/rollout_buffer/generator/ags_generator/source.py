@@ -15,6 +15,12 @@ class AGSPromptSource:
     def __init__(self, args: Namespace) -> None:
         self.args = args
         self.data_source = RolloutDataSource(args)
+        start_group = int(getattr(args, "rollout_start_group", 0) or 0)
+        if start_group > 0 and self.data_source.dataset is not None:
+            dataset_len = len(self.data_source.dataset)
+            self.data_source.sample_offset = start_group % dataset_len if dataset_len else 0
+            self.data_source.sample_group_index = start_group
+            self.data_source.sample_index = start_group * int(args.n_samples_per_prompt)
 
     def get_groups(self, num_groups: int) -> list[list[Sample]]:
         groups = self.data_source.get_samples(num_groups)
