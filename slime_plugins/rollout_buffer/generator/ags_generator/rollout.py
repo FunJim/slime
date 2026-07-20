@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 
 from slime.utils.types import Sample
 
-from .adapter_service import AdapterService
+from .adapter_service import AdapterService, RemoteAdapterService
 from .ags_sandbox import AGSSandbox
 from .artifacts import ArtifactWriter, sample_artifact_id
 from .config import AGSGeneratorConfig
@@ -27,11 +27,20 @@ logger = logging.getLogger(__name__)
 
 
 class AGSRolloutRunner:
-    def __init__(self, args: Namespace, config: AGSGeneratorConfig | None = None) -> None:
+    def __init__(
+        self,
+        args: Namespace,
+        config: AGSGeneratorConfig | None = None,
+        *,
+        use_remote_adapter: bool = False,
+    ) -> None:
         self.args = args
         self.config = config or AGSGeneratorConfig.from_env()
         self.harness_cls, self.adapter_cls = resolve_agent(self.config.agent_name)
-        self.adapter_service = AdapterService(args, self.config, self.adapter_cls)
+        if use_remote_adapter:
+            self.adapter_service = RemoteAdapterService(args, self.config)
+        else:
+            self.adapter_service = AdapterService(args, self.config, self.adapter_cls)
         self.artifacts = ArtifactWriter(self.config.artifact_dir)
         self.weave_trace = AGSWeaveTrace(
             args,

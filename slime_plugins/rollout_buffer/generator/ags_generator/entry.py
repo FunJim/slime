@@ -32,11 +32,11 @@ class _AGSGenerateState(metaclass=SingletonMeta):
     prompt.
     """
 
-    def __init__(self, args: Namespace) -> None:
+    def __init__(self, args: Namespace, *, evaluation: bool = False) -> None:
         self.config = AGSGeneratorConfig.from_env(
             enable_token2text=_as_bool(getattr(args, "enable_token2text", False))
         )
-        self.runner = AGSRolloutRunner(args, self.config)
+        self.runner = AGSRolloutRunner(args, self.config, use_remote_adapter=evaluation)
         self.semaphore = asyncio.Semaphore(self.config.rollout_concurrency)
 
 
@@ -58,7 +58,7 @@ async def generate(
     metrics count one eval attempt per prompt.
     """
 
-    state = _AGSGenerateState(args)
+    state = _AGSGenerateState(args, evaluation=evaluation)
     async with state.semaphore:
         samples = await state.runner.generate(base_sample, sampling_params)
 

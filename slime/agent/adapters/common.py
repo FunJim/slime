@@ -172,6 +172,9 @@ class BaseAdapter:
 
         self.app.router.add_get("/healthz", _health)
         self.app.router.add_get("/v1/models", _health)
+        self.app.router.add_post("/_slime/open_session", self._control_open_session)
+        self.app.router.add_post("/_slime/finish_session", self._control_finish_session)
+        self.app.router.add_post("/_slime/drop_session", self._control_drop_session)
         self._register_routes(self.app)
 
     # -- wire hooks (subclass overrides) -------------------------------------
@@ -221,6 +224,34 @@ class BaseAdapter:
             sampling_defaults=dict(sampling_defaults or {}),
             max_context_tokens=int(max_context_tokens or 0),
         )
+
+    async def _control_open_session(self, request: web.Request) -> web.Response:
+        body = await request.json()
+        sid = body["sid"]
+        self.open_session(
+            sid,
+            sampling_defaults=body.get("sampling_defaults") or {},
+            max_context_tokens=int(body.get("max_context_tokens") or 0),
+        )
+        return web.json_response({"ok": True})
+
+    async def _control_finish_session(self, request: web.Request) -> web.Response:
+        from slime.utils.types import Sample
+
+        body = await request.json()
+        samples = await self.finish_session(
+            body["sid"],
+            base_sample=Sample.from_dict(body["base_sample"]),
+            reward=float(body.get("reward", 0.0)),
+            extra_metadata=body.get("extra_metadata") or {},
+            wait_timeout=float(body.get("wait_timeout", 5.0)),
+        )
+        return web.json_response({"ok": True, "samples": [sample.to_dict() for sample in samples]})
+
+    async def _control_drop_session(self, request: web.Request) -> web.Response:
+        body = await request.json()
+        await self.drop_session(body["sid"], wait_timeout=float(body.get("wait_timeout", 5.0)))
+        return web.json_response({"ok": True})
 
     async def shutdown_session(self, sid: str, *, wait_timeout: float = 5.0) -> None:
         """Mark a sid closed and drain its in-flight turn tasks."""
