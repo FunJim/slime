@@ -125,7 +125,7 @@ cd "${SLIME_DIR}"
 source "${SLIME_DIR}/scripts/models/qwen3.5-35B-A3B.sh"
 
 SAVE_DIR="${SAVE_DIR:-${EXP}/checkpoints}"
-SAVE_INTERVAL="${SAVE_INTERVAL:-10}"
+SAVE_INTERVAL="${SAVE_INTERVAL:-5}"
 mkdir -p "${SAVE_DIR}"
 
 CKPT_ARGS=(
@@ -236,7 +236,7 @@ SGLANG_ARGS=(
 if [[ -n "${WANDB_API_KEY:-}" ]]; then
    WANDB_ARGS=(
       --use-wandb
-      --wandb-project "${WANDB_PROJECT:-slime-rl-training}"
+      --wandb-project "${WANDB_PROJECT:-slime-claude-code-ags}"
       --wandb-group "${WANDB_GROUP:-${EXP_TAG}}"
       --wandb-key "${WANDB_API_KEY}"
       --wandb-dir "${LOG_DIR}/wandb"
