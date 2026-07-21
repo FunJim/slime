@@ -104,6 +104,7 @@ export ADAPTER_PORT="${ADAPTER_PORT:-18001}"
 export SWE_AGENT_TIME_BUDGET_SEC="${SWE_AGENT_TIME_BUDGET_SEC:-1800}"
 export SWE_EVAL_TIMEOUT_SEC="${SWE_EVAL_TIMEOUT_SEC:-600}"
 export SWE_BOOT_CONCURRENCY="${SWE_BOOT_CONCURRENCY:-16}"
+export SWE_BOOT_RETRIES="${SWE_BOOT_RETRIES:-6}"
 export SWE_ROLLOUT_CONCURRENCY="${SWE_ROLLOUT_CONCURRENCY:-16}"
 
 # # autoCompactWindow (80k) < MAX_CONTEXT_LEN (96k) so the CLI compacts before any
@@ -131,6 +132,7 @@ mkdir -p "${SAVE_DIR}"
 CKPT_ARGS=(
    --hf-checkpoint "${HF_CHECKPOINT}"
    --ref-load "${REF_MODEL_PATH}"
+   --load "${LOAD_DIR:-${SAVE_DIR}}"
    --save "${SAVE_DIR}"
    --save-interval "${SAVE_INTERVAL}"
 )
@@ -286,7 +288,10 @@ if [[ -f "${HOSTFILE}" ]]; then
          --node-ip-address ${WORKER_IP} --disable-usage-stats" &
     STARTED_WORKERS=$((STARTED_WORKERS + 1))
   done
-  wait
+  for pid in $(jobs -pr); do
+    [[ "${pid}" == "${BUFFER_PID}" ]] && continue
+    wait "${pid}"
+  done
   if (( STARTED_WORKERS < WORKER_LIMIT )); then
     echo "WARNING: requested ${ACTOR_NUM_NODES} nodes but only started $((STARTED_WORKERS + 1)) including head."
   fi
@@ -316,9 +321,7 @@ keys = (
 env = {k: os.environ[k] for k in keys if k in os.environ}
 env["MASTER_ADDR"] = os.environ["MASTER_ADDR"]
 env["MASTER_PORT"] = os.environ.get("MASTER_PORT", "")
-env["GLOO_SOCKET_IFNAME"] = os.environ["GLOO_SOCKET_IFNAME"]
-env["TP_SOCKET_IFNAME"] = os.environ["GLOO_SOCKET_IFNAME"]
-env["NCCL_SOCKET_IFNAME"] = os.environ["NCCL_SOCKET_IFNAME"]
+# Keep per-node socket interface env inherited from each Ray node; do not override workers with the head ifname.
 env["PYTHONPATH"] = f"/root/Megatron-LM/:{os.environ['SLIME_DIR']}"
 env["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
 env["NCCL_NVLS_ENABLE"] = "0"
