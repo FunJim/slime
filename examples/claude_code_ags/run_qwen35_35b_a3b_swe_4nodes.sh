@@ -103,9 +103,9 @@ export ADAPTER_PORT="${ADAPTER_PORT:-18001}"
 
 export SWE_AGENT_TIME_BUDGET_SEC="${SWE_AGENT_TIME_BUDGET_SEC:-1800}"
 export SWE_EVAL_TIMEOUT_SEC="${SWE_EVAL_TIMEOUT_SEC:-600}"
-export SWE_BOOT_CONCURRENCY="${SWE_BOOT_CONCURRENCY:-16}"
-export SWE_BOOT_RETRIES="${SWE_BOOT_RETRIES:-6}"
-export SWE_ROLLOUT_CONCURRENCY="${SWE_ROLLOUT_CONCURRENCY:-16}"
+export SWE_BOOT_CONCURRENCY="${SWE_BOOT_CONCURRENCY:-32}"
+export SWE_BOOT_RETRIES="${SWE_BOOT_RETRIES:-10}"
+export SWE_ROLLOUT_CONCURRENCY="${SWE_ROLLOUT_CONCURRENCY:-32}"
 
 # # autoCompactWindow (80k) < MAX_CONTEXT_LEN (96k) so the CLI compacts before any
 # # segment crosses the training-side cap. `investigator` is a read-only sub-agent.
@@ -238,6 +238,7 @@ SGLANG_ARGS=(
 if [[ -n "${WANDB_API_KEY:-}" ]]; then
    WANDB_ARGS=(
       --use-wandb
+      --wandb-team "${WANDB_ENTITY:?WANDB_ENTITY is required when WandB is enabled}"
       --wandb-project "${WANDB_PROJECT:-slime-claude-code-ags}"
       --wandb-group "${WANDB_GROUP:-${EXP_TAG}}"
       --wandb-key "${WANDB_API_KEY}"
