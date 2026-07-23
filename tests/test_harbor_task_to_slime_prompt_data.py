@@ -67,7 +67,6 @@ def test_converter_preserves_image_head_by_default(converter_module, harbor_task
         prompt_source="problem_statement",
         image_override=None,
         default_workdir="/testbed",
-        include_pre_commands=False,
         include_eval_cmd=True,
         include_inline_files=False,
         inline_files=(),
@@ -79,47 +78,9 @@ def test_converter_preserves_image_head_by_default(converter_module, harbor_task
     assert _embedded_test_script(metadata["eval_cmd"]) == (harbor_task / "tests" / "test.sh").read_text()
 
 
-def test_converter_can_explicitly_reset_to_base_commit(converter_module, harbor_task: Path):
-    row = converter_module.task_to_row(
-        harbor_task,
-        dataset_root=harbor_task.parent,
-        source="test",
-        input_key="prompt",
-        prompt_alias_key="",
-        label_key="label",
-        metadata_key="metadata",
-        prompt_source="problem_statement",
-        image_override=None,
-        default_workdir="/testbed",
-        include_pre_commands=True,
-        include_eval_cmd=False,
-        include_inline_files=False,
-        inline_files=(),
-        provenance_root=False,
-    )
-
-    assert row["metadata"]["pre_commands"] == [
-        "git checkout deadbeef -f",
-        "git clean -fd",
-    ]
-
-
-def test_reset_to_base_commit_is_opt_in(converter_module, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+def test_reset_to_base_commit_option_is_removed(converter_module, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     input_path = tmp_path / "input"
     output_path = tmp_path / "output.jsonl"
-
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "harbor_task_to_slime_prompt_data.py",
-            "--input",
-            str(input_path),
-            "--output",
-            str(output_path),
-        ],
-    )
-    assert converter_module.parse_args().reset_to_base_commit is False
 
     monkeypatch.setattr(
         sys,
@@ -133,4 +94,15 @@ def test_reset_to_base_commit_is_opt_in(converter_module, monkeypatch: pytest.Mo
             "--reset-to-base-commit",
         ],
     )
-    assert converter_module.parse_args().reset_to_base_commit is True
+
+    with pytest.raises(SystemExit):
+        converter_module.parse_args()
+
+
+def test_gzip_payload_has_zero_mtime_and_is_reproducible(converter_module):
+    first = base64.b64decode(converter_module._gzip_base64("same content"))
+    second = base64.b64decode(converter_module._gzip_base64("same content"))
+
+    assert first == second
+    assert first[4:8] == b"\0\0\0\0"
+    assert gzip.decompress(first) == b"same content"

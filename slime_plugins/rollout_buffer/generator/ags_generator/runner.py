@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import shlex
 import time
 
-try:
-    from slime.agent.sandbox import EXIT_TIME_BUDGET_EXCEEDED
-except ImportError:  # older slime checkout keeps this constant in harness.common
-    from slime.agent.harness.common import EXIT_TIME_BUDGET_EXCEEDED
-from slime.agent.sandbox import Sandbox
+from slime.agent.sandbox import EXIT_TIME_BUDGET_EXCEEDED, Sandbox, terminate_process_group
+
+logger = logging.getLogger(__name__)
 
 
 async def run_root_command(
@@ -27,6 +26,8 @@ async def run_root_command(
     done = f"{meta_dir}/done"
     launcher = f"{meta_dir}/run.sh"
     traj = f"{meta_dir}/trajectory.jsonl"
+    pid_file = f"{meta_dir}/pid"
+    lock_dir = f"{meta_dir}/spawned"
     launcher_body = (
         "#!/bin/bash\n"
         f"cd {workdir}\n"
@@ -40,7 +41,10 @@ async def run_root_command(
 
     export_lines = " ".join(f"{k}={shlex.quote(str(v))}" for k, v in env.items())
     await sb.exec(
-        f"env {export_lines} setsid {launcher} < /dev/null > /dev/null 2>&1 &",
+        f"mkdir {lock_dir} 2>/dev/null || exit 0; "
+        f"rm -f {done} {pid_file}; "
+        f"env {export_lines} setsid {launcher} < /dev/null > /dev/null 2>&1 & "
+        f"echo $! > {pid_file}",
         user="root",
         timeout=30,
         check=True,
@@ -54,4 +58,7 @@ async def run_root_command(
         if ec == 0 and (out or "").strip():
             exit_code = int((out or "").strip())
             break
+    if exit_code == EXIT_TIME_BUDGET_EXCEEDED:
+        logger.warning("AGS agent exceeded %ss; terminating process group", time_budget_sec)
+        await terminate_process_group(sb, pid_file=pid_file, user="root")
     return exit_code

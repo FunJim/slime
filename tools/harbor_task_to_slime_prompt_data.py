@@ -17,12 +17,14 @@ built from Harbor's tests/test.sh plus tests/config.json so the row can be used
 by ags_generator without a harbor_task_path.
 
 Important: Harbor verifier assets are created inside metadata.eval_cmd, not
-metadata.pre_commands.  eval_cmd runs only in the clean evaluator sandbox, so
-it keeps hidden grading data out of the agent sandbox.  Converted Harbor tasks
-preserve the prebuilt task image's Git HEAD by default: that image can contain
-task-specific environment compatibility commits beyond
-``tests/config.json.base_commit``.  Use --reset-to-base-commit only for an
-explicit legacy/debug workflow that intentionally discards those commits.
+metadata.pre_commands, so they are materialized only after the foreground agent
+process returns.  With ``SWE_EVAL_ISOLATED_SANDBOX=true`` this happens in a
+separate clean sandbox.  With the default ``false`` it happens in the existing
+agent sandbox; that mode avoids a second sandbox boot but is not a security
+boundary against a root-capable agent or background processes it leaves behind.
+Converted Harbor tasks preserve the prebuilt task image's Git HEAD by default:
+that image can contain task-specific environment compatibility commits beyond
+``tests/config.json.base_commit``.
 
 Example:
     python tools/harbor_task_to_slime_prompt_data.py \
@@ -129,24 +131,6 @@ def parse_args() -> argparse.Namespace:
         help="Override image for all rows. By default it is extracted from the active Dockerfile FROM line.",
     )
     parser.add_argument(
-        "--reset-to-base-commit",
-        action="store_true",
-        help=(
-            "Write metadata.pre_commands that reset the workspace to "
-            "tests/config.json.base_commit. Disabled by default because it "
-            "discards task-image environment compatibility commits."
-        ),
-    )
-    parser.add_argument(
-        "--no-pre-commands",
-        action="store_false",
-        dest="reset_to_base_commit",
-        help=(
-            "Deprecated compatibility alias. Harbor conversion now preserves "
-            "the task image HEAD by default, so this is normally a no-op."
-        ),
-    )
-    parser.add_argument(
         "--no-eval-cmd",
         action="store_true",
         help="Do not derive metadata.eval_cmd from tests/test.sh and tests/config.json.",
@@ -242,7 +226,6 @@ def task_to_row(
     prompt_source: str,
     image_override: str | None,
     default_workdir: str,
-    include_pre_commands: bool,
     include_eval_cmd: bool,
     include_inline_files: bool,
     inline_files: tuple[str, ...],
@@ -262,8 +245,6 @@ def task_to_row(
     if not image:
         raise ValueError(f"Cannot extract Docker image from {task_dir / 'environment' / 'Dockerfile'}")
     workdir = extract_dockerfile_workdir(dockerfile) or default_workdir
-    base_commit = swe_config.get("base_commit")
-
     row: dict[str, Any] = {input_key: prompt}
     if prompt_alias_key and prompt_alias_key != input_key:
         row[prompt_alias_key] = prompt
@@ -278,11 +259,6 @@ def task_to_row(
         "problem_statement": problem_statement,
         "harbor": harbor_metadata(task_dir, source_name, task_toml, swe_config, image, workdir),
     }
-    if include_pre_commands and base_commit:
-        metadata["pre_commands"] = [
-            f"git checkout {shlex.quote(str(base_commit))} -f",
-            "git clean -fd",
-        ]
     if include_eval_cmd:
         metadata["eval_cmd"] = build_eval_cmd(task_dir, swe_config)
     if include_inline_files:
@@ -375,12 +351,12 @@ def build_eval_cmd(task_dir: Path, swe_config: dict[str, Any]) -> str:
     """Build an eval-only command that materializes Harbor verifier assets.
 
     AGS does not mount the Harbor task directory, so tests/config.json and
-    tests/test.sh must be embedded in the prompt-data row. Keep these hidden
-    grading assets inside eval_cmd rather than pre_commands: pre_commands are
-    executed in the agent sandbox before the agent runs, while eval_cmd is only
-    executed in the separate evaluator sandbox after the agent patch is
-    collected. This preserves the SWE-bench setting and avoids exposing
-    FAIL_TO_PASS/PASS_TO_PASS/test_patch/reference_patch to the agent.
+    tests/test.sh must be embedded in the prompt-data row. Keep these grading
+    assets inside eval_cmd rather than pre_commands: pre_commands run before the
+    agent, while eval_cmd runs only after the foreground agent process returns.
+    A separate clean grading environment and a strong no-test-cheating boundary
+    require SWE_EVAL_ISOLATED_SANDBOX=true. With the default false, eval_cmd
+    materializes the assets later in the same root-capable agent sandbox.
 
     The embedded files intentionally use Harbor's canonical absolute paths
     (/tests/config.json, /tests/test.sh, and /logs/verifier) instead of /tmp
@@ -416,8 +392,8 @@ def build_eval_cmd(task_dir: Path, swe_config: dict[str, Any]) -> str:
         [
             "set -euo pipefail",
             # /tests and /logs are part of Harbor's verifier contract. Create
-            # them here so they exist only in the eval sandbox, not in the
-            # agent sandbox.
+            # them only when eval_cmd starts; whether that is the existing agent
+            # sandbox or a clean sandbox is selected at rollout runtime.
             "mkdir -p /tests /logs/verifier",
             _python_heredoc(decoder, decoder_delim),
             f"chmod +x {shlex.quote(script_path)}",
@@ -475,8 +451,13 @@ def write_schema(output: Path, *, input_key: str, prompt_alias_key: str, label_k
                 "image": {"type": "string", "description": "Sandbox image consumed by ags_generator."},
                 "workdir": {"type": "string", "description": "Repository path inside the sandbox."},
                 "problem_statement": {"type": "string"},
-                "pre_commands": {"type": "array", "items": {"type": "string"}},
-                "eval_cmd": {"type": "string", "description": "Reward command; exit 0 means reward 1."},
+                "eval_cmd": {
+                    "type": "string",
+                    "description": (
+                        "Reward command run after the agent; the rollout's "
+                        "SWE_EVAL_ISOLATED_SANDBOX setting selects the sandbox."
+                    ),
+                },
                 "harbor": {"type": "object", "description": "Extracted Harbor/SWE provenance and grading fields."},
                 "harbor_task": {
                     "type": "object",
@@ -519,7 +500,6 @@ def convert_tasks(
     prompt_source: str,
     image_override: str | None,
     default_workdir: str,
-    include_pre_commands: bool,
     include_eval_cmd: bool,
     include_inline_files: bool,
     inline_files: tuple[str, ...],
@@ -543,7 +523,6 @@ def convert_tasks(
                 prompt_source=prompt_source,
                 image_override=image_override,
                 default_workdir=default_workdir,
-                include_pre_commands=include_pre_commands,
                 include_eval_cmd=include_eval_cmd,
                 include_inline_files=include_inline_files,
                 inline_files=inline_files,
@@ -568,7 +547,6 @@ def convert_tasks(
                 prompt_source=prompt_source,
                 image_override=image_override,
                 default_workdir=default_workdir,
-                include_pre_commands=include_pre_commands,
                 include_eval_cmd=include_eval_cmd,
                 include_inline_files=include_inline_files,
                 inline_files=inline_files,
@@ -626,7 +604,7 @@ def _heredoc(path: str, content: str, delimiter: str) -> str:
 
 
 def _gzip_base64(content: str) -> str:
-    return base64.b64encode(gzip.compress(content.encode("utf-8"))).decode("ascii")
+    return base64.b64encode(gzip.compress(content.encode("utf-8"), mtime=0)).decode("ascii")
 
 
 def _python_heredoc(script: str, delimiter: str) -> str:
@@ -663,7 +641,6 @@ def main() -> None:
         prompt_source=args.prompt_source,
         image_override=args.image,
         default_workdir=args.default_workdir,
-        include_pre_commands=args.reset_to_base_commit,
         include_eval_cmd=not args.no_eval_cmd,
         include_inline_files=args.include_inline_files,
         inline_files=inline_files,

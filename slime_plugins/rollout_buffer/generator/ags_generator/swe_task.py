@@ -85,6 +85,7 @@ async def git_diff(sb: Sandbox, workdir: str) -> str:
 
 async def evaluate(
     *,
+    sandbox: Sandbox | None = None,
     image: str,
     workdir: str,
     diff_text: str,
@@ -99,27 +100,72 @@ async def evaluate(
         logger.warning("[ags_generator.evaluate] no swepro/eval_cmd/f2p_script; reward=0")
         return 0.0, True
 
+    if sandbox is not None:
+        return await _evaluate_in_sandbox(
+            sandbox,
+            workdir=workdir,
+            diff_text=diff_text,
+            swepro=swepro,
+            eval_cmd=eval_cmd,
+            f2p_script=f2p_script,
+            pre_commands=pre_commands,
+            eval_bootstrap_cmd=eval_bootstrap_cmd,
+            timeout_sec=timeout_sec,
+            isolated=False,
+        )
+
     async with AGSSandbox(image) as ev:
+        return await _evaluate_in_sandbox(
+            ev,
+            workdir=workdir,
+            diff_text=diff_text,
+            swepro=swepro,
+            eval_cmd=eval_cmd,
+            f2p_script=f2p_script,
+            pre_commands=pre_commands,
+            eval_bootstrap_cmd=eval_bootstrap_cmd,
+            timeout_sec=timeout_sec,
+            isolated=True,
+        )
+
+
+async def _evaluate_in_sandbox(
+    ev: Sandbox,
+    *,
+    workdir: str,
+    diff_text: str,
+    swepro: dict[str, Any] | None,
+    eval_cmd: str | None,
+    f2p_script: str | None,
+    pre_commands: list[str] | str | None,
+    eval_bootstrap_cmd: str | None,
+    timeout_sec: int,
+    isolated: bool,
+) -> tuple[float, bool]:
+    if isolated:
         await agent_sandbox.ensure_agent_user(ev, workdir)
-        if swepro:
-            await _setup_swepro_assets(ev, swepro)
+    if swepro:
+        await _setup_swepro_assets(ev, swepro)
+        if isolated:
             await apply_before_repo_set_cmd(ev, workdir, swepro)
+    if isolated:
         if pre_commands:
             await apply_pre_commands(ev, workdir, pre_commands)
-        if eval_bootstrap_cmd:
-            await _run_eval_bootstrap(ev, workdir, eval_bootstrap_cmd, timeout=min(600, max(120, timeout_sec)))
+    if eval_bootstrap_cmd:
+        await _run_eval_bootstrap(ev, workdir, eval_bootstrap_cmd, timeout=min(600, max(120, timeout_sec)))
 
+    if isolated:
         applied = await _apply_diff(ev, workdir, diff_text)
         if not applied:
             return 0.0, False
 
-        if swepro:
-            reward = await _run_swepro(ev, workdir, swepro, timeout_sec)
-        elif eval_cmd:
-            reward = await _run_eval_cmd(ev, workdir, eval_cmd, timeout_sec)
-        else:
-            reward = await _run_f2p_script(ev, workdir, f2p_script or "", timeout_sec)
-        return reward, True
+    if swepro:
+        reward = await _run_swepro(ev, workdir, swepro, timeout_sec)
+    elif eval_cmd:
+        reward = await _run_eval_cmd(ev, workdir, eval_cmd, timeout_sec)
+    else:
+        reward = await _run_f2p_script(ev, workdir, f2p_script or "", timeout_sec)
+    return reward, True
 
 
 async def _setup_swepro_assets(ev: Sandbox, swepro: dict[str, Any]) -> None:
@@ -174,9 +220,9 @@ async def _run_eval_cmd(ev: Sandbox, workdir: str, cmd: str, timeout: int) -> fl
     # /tests/config.json, /tests/test.sh, /logs/verifier, and a parser next to
     # /testbed (via `cd ..`). The verified SWE-bench images do not pre-create
     # those root-owned paths for the unprivileged agent user, and we want to run
-    # Harbor's test.sh verbatim rather than patching its paths. This happens only
-    # in the separate evaluator sandbox after the agent patch is collected, so
-    # hidden grading assets are not exposed to the agent sandbox.
+    # Harbor's test.sh verbatim rather than patching its paths. Evaluation starts
+    # only after the agent process exits; depending on SWE_EVAL_ISOLATED_SANDBOX,
+    # it runs either in that agent sandbox or in a separate clean sandbox.
     ec, _, _ = await ev.exec(f"cd {workdir} && {cmd}", user="root", check=False, timeout=timeout)
     return 1.0 if ec == 0 else 0.0
 

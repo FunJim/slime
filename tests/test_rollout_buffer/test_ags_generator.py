@@ -8,9 +8,12 @@ import sys
 import types
 from types import SimpleNamespace
 
+import pytest
 from tests.test_agent._fakes import FakeSandbox
 
 from slime.utils.types import Sample
+from slime_plugins.rollout_buffer.generator.ags_generator import swe_task
+from slime_plugins.rollout_buffer.generator.ags_generator.config import AGSGeneratorConfig
 from slime_plugins.rollout_buffer.generator.ags_generator.entry import (
     _collapse_eval_samples,
     get_group_data_meta_info,
@@ -18,6 +21,7 @@ from slime_plugins.rollout_buffer.generator.ags_generator.entry import (
     transform_group,
 )
 from slime_plugins.rollout_buffer.generator.ags_generator.harnesses import CodeBuddyCodeHarness, resolve_agent
+from slime_plugins.rollout_buffer.generator.ags_generator.runner import run_root_command
 from slime_plugins.rollout_buffer.generator.ags_generator.sampling import normalize_sampling_params
 from slime_plugins.rollout_buffer.generator.ags_generator.serialization import (
     output_item_from_samples,
@@ -102,6 +106,77 @@ def test_sampling_params_use_sglang_generate_names():
         "max_new_tokens": 128,
         "temperature": 1.0,
     }
+
+
+def test_eval_isolated_sandbox_defaults_to_false(monkeypatch):
+    monkeypatch.delenv("SWE_EVAL_ISOLATED_SANDBOX", raising=False)
+
+    assert AGSGeneratorConfig.from_env().eval_isolated_sandbox is False
+
+
+def test_eval_isolated_sandbox_can_be_enabled(monkeypatch):
+    monkeypatch.setenv("SWE_EVAL_ISOLATED_SANDBOX", "true")
+
+    assert AGSGeneratorConfig.from_env().eval_isolated_sandbox is True
+
+
+def test_evaluate_can_reuse_agent_sandbox(monkeypatch):
+    async def run_case():
+        monkeypatch.setattr(
+            swe_task,
+            "AGSSandbox",
+            lambda _image: (_ for _ in ()).throw(AssertionError("must not boot an isolated sandbox")),
+        )
+        sb = FakeSandbox()
+
+        reward, applied = await swe_task.evaluate(
+            sandbox=sb,
+            image="unused-image",
+            workdir="/workspace/repo",
+            diff_text="diff --git a/a.py b/a.py",
+            eval_cmd="pytest -q",
+            pre_commands=["echo must-not-rerun"],
+            eval_bootstrap_cmd="echo bootstrap",
+        )
+
+        assert reward == 1.0
+        assert applied is True
+        commands = [cmd for cmd, _user in sb.exec_log]
+        assert "cd /workspace/repo && pytest -q" in commands
+        assert "cd /workspace/repo && echo bootstrap" in commands
+        assert not any("must-not-rerun" in cmd for cmd in commands)
+        assert not any("git apply" in cmd or "patch -p1" in cmd for cmd in commands)
+
+    asyncio.run(run_case())
+
+
+def test_evaluate_isolated_sandbox_keeps_clean_apply_flow(monkeypatch):
+    async def run_case():
+        sandboxes = []
+
+        def sandbox_factory(image):
+            sb = FakeSandbox(image)
+            sandboxes.append(sb)
+            return sb
+
+        monkeypatch.setattr(swe_task, "AGSSandbox", sandbox_factory)
+
+        reward, applied = await swe_task.evaluate(
+            sandbox=None,
+            image="eval-image",
+            workdir="/workspace/repo",
+            diff_text="diff --git a/a.py b/a.py",
+            eval_cmd="pytest -q",
+        )
+
+        assert reward == 1.0
+        assert applied is True
+        assert len(sandboxes) == 1
+        commands = [cmd for cmd, _user in sandboxes[0].exec_log]
+        assert any("git apply --3way" in cmd for cmd in commands)
+        assert "cd /workspace/repo && pytest -q" in commands
+
+    asyncio.run(run_case())
 
 
 class _FakeTokenizer:
@@ -584,5 +659,27 @@ def test_codebuddy_code_launch_command_and_env(monkeypatch):
         assert "CBC_API_KEY=sess-cbc" in launch_cmd
         assert "CBC_BASE_URL=http://host:18001/v1/chat/completions" in launch_cmd
         assert "IS_SANDBOX=1" in launch_cmd
+        assert any("kill -TERM" in cmd for cmd, _user in sb.exec_log)
+        assert any("kill -KILL" in cmd for cmd, _user in sb.exec_log)
+
+    asyncio.run(run_case())
+
+
+def test_ags_timeout_fails_closed_if_agent_process_group_cannot_be_stopped():
+    class StopFailureSandbox(FakeSandbox):
+        async def exec(self, cmd, **kwargs):
+            if "kill -TERM" in cmd:
+                raise RuntimeError("cannot stop agent")
+            return await super().exec(cmd, **kwargs)
+
+    async def run_case():
+        with pytest.raises(RuntimeError, match="cannot stop agent"):
+            await run_root_command(
+                StopFailureSandbox(),
+                workdir="/workspace/repo",
+                start_cmd="claude -p solve",
+                env={},
+                time_budget_sec=0,
+            )
 
     asyncio.run(run_case())

@@ -72,6 +72,16 @@ class AGSRolloutRunner:
         t0 = time.time()
         session_opened = False
         trajectory_path = None
+        evaluation_args = {
+            "image": md["image"],
+            "workdir": md["workdir"],
+            "swepro": md["swepro"],
+            "eval_cmd": md["eval_cmd"],
+            "f2p_script": md["f2p_script"],
+            "pre_commands": md["pre_commands"],
+            "eval_bootstrap_cmd": self.config.eval_bootstrap_cmd,
+            "timeout_sec": self.config.eval_timeout_sec,
+        }
         try:
             self.adapter_service.adapter.open_session(
                 session_id,
@@ -93,18 +103,19 @@ class AGSRolloutRunner:
                     trajectory_path = await self.artifacts.dump_trajectory(sb, md["workdir"], artifact_id)
                     diff_text = await git_diff(sb, md["workdir"])
                     patch_path = self.artifacts.dump_patch(diff_text, artifact_id)
+                    if not self.config.eval_isolated_sandbox:
+                        reward, applied_cleanly = await evaluate(
+                            sandbox=sb,
+                            diff_text=diff_text,
+                            **evaluation_args,
+                        )
 
-                reward, applied_cleanly = await evaluate(
-                    image=md["image"],
-                    workdir=md["workdir"],
-                    diff_text=diff_text,
-                    swepro=md["swepro"],
-                    eval_cmd=md["eval_cmd"],
-                    f2p_script=md["f2p_script"],
-                    pre_commands=md["pre_commands"],
-                    eval_bootstrap_cmd=self.config.eval_bootstrap_cmd,
-                    timeout_sec=self.config.eval_timeout_sec,
-                )
+                if self.config.eval_isolated_sandbox:
+                    reward, applied_cleanly = await evaluate(
+                        sandbox=None,
+                        diff_text=diff_text,
+                        **evaluation_args,
+                    )
                 samples = await self.adapter_service.adapter.finish_session(
                     session_id,
                     base_sample=base_sample,
@@ -126,6 +137,7 @@ class AGSRolloutRunner:
                         "agent": self.config.agent_name,
                         "reward": float(reward),
                         "applied_cleanly": bool(applied_cleanly),
+                        "eval_isolated_sandbox": self.config.eval_isolated_sandbox,
                         "agent_exit_code": agent_exit_code,
                         "elapsed_sec": time.time() - t0,
                         "num_samples": len(samples),
@@ -141,6 +153,7 @@ class AGSRolloutRunner:
                         "agent": self.config.agent_name,
                         "agent_exit_code": agent_exit_code,
                         "applied_cleanly": bool(applied_cleanly),
+                        "eval_isolated_sandbox": self.config.eval_isolated_sandbox,
                         "trajectory_path": trajectory_path,
                         "patch_path": patch_path,
                         "rollout_dump_path": rollout_path,
@@ -149,10 +162,11 @@ class AGSRolloutRunner:
                         "ags_rollout_concurrency": self.config.rollout_concurrency,
                     }
                 logger.info(
-                    "[ags_generator] %s: reward=%.2f applied=%s exit=%s elapsed=%.1fs segments=%d",
+                    "[ags_generator] %s: reward=%.2f applied=%s eval_isolated=%s exit=%s elapsed=%.1fs segments=%d",
                     instance_id,
                     float(reward),
                     bool(applied_cleanly),
+                    self.config.eval_isolated_sandbox,
                     agent_exit_code,
                     elapsed_sec,
                     len(samples),

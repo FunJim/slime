@@ -16,6 +16,7 @@ class AGSGeneratorConfig:
     agent_time_budget_sec: int
     eval_timeout_sec: int
     eval_bootstrap_cmd: str | None
+    eval_isolated_sandbox: bool
     rollout_guard_sec: int
     boot_concurrency: int
     rollout_concurrency: int
@@ -40,6 +41,7 @@ class AGSGeneratorConfig:
             agent_time_budget_sec=agent_time_budget,
             eval_timeout_sec=eval_timeout,
             eval_bootstrap_cmd=os.environ.get("SWE_EVAL_BOOTSTRAP_CMD") or None,
+            eval_isolated_sandbox=_env_flag("SWE_EVAL_ISOLATED_SANDBOX", default=False),
             rollout_guard_sec=guard,
             boot_concurrency=int(os.environ.get("SWE_BOOT_CONCURRENCY", "16")),
             rollout_concurrency=max(1, rollout_concurrency),
@@ -51,3 +53,10 @@ class AGSGeneratorConfig:
                 "Read PROBLEM_STATEMENT.md in the current directory and resolve the issue. Edit source files only (do NOT touch tests). After editing, run the relevant tests to verify your fix passes. Do NOT modify PROBLEM_STATEMENT.md and do NOT commit. When finished, print a one-line summary and exit.",
             ),
         )
+
+
+def _env_flag(name: str, *, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return raw.lower() in {"1", "true", "yes", "on"}
