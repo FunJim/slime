@@ -71,6 +71,7 @@ def test_run_agent_returns_marker_exit_code():
         assert any("run.sh" in p for p in sb.files)
         assert _find(sb.exec_log, "setsid")
         assert any("echo $?" in v for v in sb.files.values())
+        assert not _find(sb.exec_log, "kill -TERM")
 
     asyncio.run(run_case())
 
@@ -94,6 +95,8 @@ def test_run_agent_times_out_when_marker_never_appears():
         with patch.object(hc.asyncio, "sleep", new=_fast_sleep):
             rc = await hc.run_agent(sb, workdir="/w", start_cmd="x", env={}, time_budget_sec=0)
         assert rc == sandbox_mod.EXIT_TIME_BUDGET_EXCEEDED
+        assert _find(sb.exec_log, "kill -TERM")
+        assert _find(sb.exec_log, "kill -KILL")
 
     asyncio.run(run_case())
 

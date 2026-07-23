@@ -80,14 +80,18 @@ def train(args):
                 ray.get(rollout_manager.save.remote(rollout_id))
 
         offload_train(actor_trains)
-        if args.offload_rollout and not release_train:
-            ray.get(rollout_manager.onload_weights.remote())
-        actor_model.update_weights()
 
-        if args.offload_rollout:
-            ray.get(rollout_manager.onload_kv.remote())
+        will_eval = should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch)
+        needs_rollout_after_step = (rollout_id + 1 < args.num_rollout) or will_eval
+        if needs_rollout_after_step:
+            if args.offload_rollout and not release_train:
+                ray.get(rollout_manager.onload_weights.remote())
+            actor_model.update_weights()
 
-        if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
+            if args.offload_rollout:
+                ray.get(rollout_manager.onload_kv.remote())
+
+        if will_eval:
             ray.get(rollout_manager.eval.remote(rollout_id))
 
     ray.get(rollout_manager.dispose.remote())

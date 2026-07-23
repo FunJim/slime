@@ -5,10 +5,12 @@ import json
 import pathlib
 import threading
 import time
+import traceback
+import uuid
 from typing import Any
 
 import uvicorn
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
 app = FastAPI(title="Rollout Buffer Server", debug=True)
@@ -221,6 +223,7 @@ class RolloutBuffer:
         transform_group_func=None,
         is_valid_group_func=None,
         get_group_data_meta_info_func=None,
+        rollout_job_id: str | None = None,
     ):
         self.buffer = BufferQueue(
             group_size=group_size,
@@ -234,9 +237,14 @@ class RolloutBuffer:
         self.total_written = 0
         self.total_read = 0
         self.task_type = task_type
+        self.rollout_job_id = rollout_job_id
 
     def write(self, data):
         with self.lock:
+            item_job_id = data.get("rollout_job_id")
+            if self.rollout_job_id and item_job_id is not None and item_job_id != self.rollout_job_id:
+                print(f"Ignore stale rollout item from job {item_job_id}; " f"current job is {self.rollout_job_id}")
+                return None
             self.buffer.append(data)
             self.total_written += 1
             self.not_empty.notify_all()
@@ -256,11 +264,87 @@ class RolloutBuffer:
 buffer = RolloutBuffer()
 
 
+class RolloutJob:
+    def __init__(self, payload: dict[str, Any]):
+        self.job_id = str(uuid.uuid4())
+        self.payload = dict(payload)
+        self.stop_event = threading.Event()
+        self.started_at = time.time()
+        self.finished_at: float | None = None
+        self.status = "starting"
+        self.error: str | None = None
+        self.thread = threading.Thread(
+            target=self._run,
+            name=f"rollout-buffer-{self.job_id[:8]}",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+
+    def is_alive(self) -> bool:
+        return self.thread.is_alive()
+
+    def join(self, timeout: float | None = None) -> bool:
+        self.thread.join(timeout)
+        return not self.thread.is_alive()
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "job_id": self.job_id,
+            "status": self.status,
+            "alive": self.thread.is_alive(),
+            "stop_requested": self.stop_event.is_set(),
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "error": self.error,
+        }
+
+    def _run(self) -> None:
+        self.status = "running"
+        try:
+            run_rollout(self.payload, stop_event=self.stop_event, rollout_job_id=self.job_id)
+            self.status = "stopped" if self.stop_event.is_set() else "finished"
+        except Exception as exc:
+            self.status = "failed"
+            self.error = f"{type(exc).__name__}: {exc}"
+            print(f"Rollout job {self.job_id} failed: {self.error}")
+            traceback.print_exc()
+        finally:
+            self.finished_at = time.time()
+
+
+current_rollout_job: RolloutJob | None = None
+rollout_job_lock = threading.RLock()
+
+
+def _stop_current_rollout_job(wait: bool, timeout_sec: float | None) -> dict[str, Any]:
+    with rollout_job_lock:
+        job = current_rollout_job
+    if job is None:
+        return {"had_job": False, "stopped": True, "job": None}
+
+    job.stop()
+    stopped = True
+    if wait and job.is_alive():
+        stopped = job.join(timeout_sec)
+    return {"had_job": True, "stopped": stopped, "job": job.snapshot()}
+
+
 @app.post("/buffer/write", response_model=BufferResponse)
 async def write_to_buffer(request: Request):
     try:
         data = await request.json()
         item = buffer.write(data)
+        if item is None:
+            return BufferResponse(
+                success=False,
+                message="Ignored stale rollout item",
+                data={"data": [], "meta_info": "stale rollout job"},
+            )
         return BufferResponse(
             success=True,
             message="Data has been successfully written to buffer",
@@ -295,7 +379,11 @@ async def get_rollout_data(request: Request):
     )
 
 
-def run_rollout(data: dict):
+def run_rollout(
+    data: dict,
+    stop_event: threading.Event | None = None,
+    rollout_job_id: str | None = None,
+):
     global buffer
     # Auto-discover generators
     generator_map = discover_generators()
@@ -315,18 +403,58 @@ def run_rollout(data: dict):
         transform_group_func=generator_info.get("transform_group", None),
         is_valid_group_func=generator_info.get("is_valid_group"),
         get_group_data_meta_info_func=generator_info.get("get_group_data_meta_info"),
+        rollout_job_id=rollout_job_id,
     )
 
     # Call the run_rollout function from the appropriate generator module
-    generator_info["run_rollout"](data)
+    generator_payload = dict(data)
+    if stop_event is not None:
+        generator_payload["_stop_event"] = stop_event
+    if rollout_job_id is not None:
+        generator_payload["_rollout_job_id"] = rollout_job_id
+    generator_info["run_rollout"](generator_payload)
     print(f"Rollout completed successfully for task_type: {task_type}")
 
 
 @app.post("/start_rollout")
-async def start_rollout(request: Request, background: BackgroundTasks):
+async def start_rollout(request: Request):
+    global current_rollout_job
     payload = await request.json()
-    background.add_task(run_rollout, payload)
-    return {"message": "Rollout started"}
+
+    stop_timeout_sec = float(payload.get("stop_previous_timeout_sec", 60))
+    stopped = _stop_current_rollout_job(wait=True, timeout_sec=stop_timeout_sec)
+    if stopped["had_job"] and not stopped["stopped"]:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Previous rollout is still running after stop request; refusing to start a new one.",
+                "previous": stopped["job"],
+            },
+        )
+
+    job = RolloutJob(payload)
+    with rollout_job_lock:
+        current_rollout_job = job
+    job.start()
+    return {"message": "Rollout started", "rollout_job_id": job.job_id, "previous": stopped}
+
+
+@app.post("/stop_rollout")
+async def stop_rollout(request: Request):
+    payload = await request.json()
+    wait = bool(payload.get("wait", True))
+    timeout_sec = payload.get("timeout_sec", 60)
+    timeout_sec = None if timeout_sec is None else float(timeout_sec)
+    return _stop_current_rollout_job(wait=wait, timeout_sec=timeout_sec)
+
+
+@app.get("/rollout_status")
+async def rollout_status():
+    with rollout_job_lock:
+        job = current_rollout_job
+    if job is None:
+        return {"job": None}
+    return {"job": job.snapshot()}
 
 
 if __name__ == "__main__":

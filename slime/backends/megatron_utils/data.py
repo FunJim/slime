@@ -11,7 +11,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 
 from slime.utils import train_metric_utils
 from slime.utils.flops_utils import calculate_fwd_flops
-from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step
+from slime.utils.metric_utils import compute_grouped_pass_rate, compute_pass_rate, compute_rollout_step
 from slime.utils.types import RolloutBatch
 
 from ...utils import logging_utils
@@ -283,6 +283,8 @@ def log_rollout_data(
                 "loss_masks",
                 "sample_indices",
                 "rollout_ids",
+                "raw_reward_group_indices",
+                "raw_reward_rollout_ids",
                 "rollout_mask_sums",
                 "rollout_top_p_token_ids",
                 "rollout_top_p_token_offsets",
@@ -481,12 +483,20 @@ def log_passrate(rollout_id: int, args: Namespace, rollout_data: RolloutBatch) -
     """
     if mpu.get_tensor_model_parallel_rank() == 0 and mpu.is_pipeline_last_stage():
         log_dict = {}
-        for key, val in rollout_data.items():
-            if key != "raw_reward":
-                continue
+        raw_rewards = rollout_data.get("raw_reward")
+        if raw_rewards is None:
+            return
 
+        if "raw_reward_group_indices" in rollout_data and "raw_reward_rollout_ids" in rollout_data:
+            log_dict |= compute_grouped_pass_rate(
+                flat_rewards=raw_rewards,
+                group_indices=rollout_data["raw_reward_group_indices"],
+                rollout_ids=rollout_data["raw_reward_rollout_ids"],
+                group_size=args.n_samples_per_prompt,
+            )
+        else:
             log_dict |= compute_pass_rate(
-                flat_rewards=val,
+                flat_rewards=raw_rewards,
                 group_size=args.n_samples_per_prompt,
                 num_groups=args.rollout_batch_size,
             )
