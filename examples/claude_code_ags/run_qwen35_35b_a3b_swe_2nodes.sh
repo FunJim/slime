@@ -94,7 +94,7 @@ export SWE_AGENT="${SWE_AGENT:-claude_code}"
 export E2B_DOMAIN="${E2B_DOMAIN:-ap-shanghai.tencentags.com}"
 export AGS_BASE_TOOL="${AGS_BASE_TOOL:-sdt-3fzh6mv6}"
 export AGS_IMAGE_REGISTRY_TYPE="${AGS_IMAGE_REGISTRY_TYPE:-enterprise}"
-export AGS_SANDBOX_RESOURCES_JSON=${AGS_SANDBOX_RESOURCES_JSON:-'{"cpu":"2","memory":"4Gi"}'}
+export AGS_SANDBOX_RESOURCES_JSON=${AGS_SANDBOX_RESOURCES_JSON:-'{"cpu":"4","memory":"16Gi"}'}
 
 # ADAPTER_PUBLIC_HOST must be routable from inside the AGS sandbox (not 127.0.0.1).
 export ADAPTER_PUBLIC_HOST="${ADAPTER_PUBLIC_HOST:-${MASTER_ADDR:-${MLP_WORKER_0_HOST:-127.0.0.1}}}"
