@@ -9,7 +9,6 @@ set of fields that slime's AGS rollout-buffer generator already consumes:
   - metadata.image
   - metadata.workdir
   - metadata.problem_statement
-  - metadata.pre_commands
   - metadata.eval_cmd
 
 The generated rows are still ordinary slime JSONL prompt data: use --input-key
@@ -18,11 +17,12 @@ built from Harbor's tests/test.sh plus tests/config.json so the row can be used
 by ags_generator without a harbor_task_path.
 
 Important: Harbor verifier assets are created inside metadata.eval_cmd, not
-metadata.pre_commands.  pre_commands run in both the agent sandbox and the eval
-sandbox, so putting tests/config.json there would leak hidden grading data to
-the agent.  eval_cmd runs only in the eval sandbox.  To preserve Harbor's
-expected verifier layout, eval_cmd materializes /tests/config.json and
-/logs/verifier before invoking the patched Harbor tests/test.sh.
+metadata.pre_commands.  eval_cmd runs only in the clean evaluator sandbox, so
+it keeps hidden grading data out of the agent sandbox.  Converted Harbor tasks
+preserve the prebuilt task image's Git HEAD by default: that image can contain
+task-specific environment compatibility commits beyond
+``tests/config.json.base_commit``.  Use --reset-to-base-commit only for an
+explicit legacy/debug workflow that intentionally discards those commits.
 
 Example:
     python tools/harbor_task_to_slime_prompt_data.py \
@@ -129,9 +129,22 @@ def parse_args() -> argparse.Namespace:
         help="Override image for all rows. By default it is extracted from the active Dockerfile FROM line.",
     )
     parser.add_argument(
-        "--no-pre-commands",
+        "--reset-to-base-commit",
         action="store_true",
-        help="Do not write metadata.pre_commands to reset the repo to base_commit.",
+        help=(
+            "Write metadata.pre_commands that reset the workspace to "
+            "tests/config.json.base_commit. Disabled by default because it "
+            "discards task-image environment compatibility commits."
+        ),
+    )
+    parser.add_argument(
+        "--no-pre-commands",
+        action="store_false",
+        dest="reset_to_base_commit",
+        help=(
+            "Deprecated compatibility alias. Harbor conversion now preserves "
+            "the task image HEAD by default, so this is normally a no-op."
+        ),
     )
     parser.add_argument(
         "--no-eval-cmd",
@@ -650,7 +663,7 @@ def main() -> None:
         prompt_source=args.prompt_source,
         image_override=args.image,
         default_workdir=args.default_workdir,
-        include_pre_commands=not args.no_pre_commands,
+        include_pre_commands=args.reset_to_base_commit,
         include_eval_cmd=not args.no_eval_cmd,
         include_inline_files=args.include_inline_files,
         inline_files=inline_files,
