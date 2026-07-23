@@ -88,6 +88,25 @@ def select_rollout_data(args, results, need_length):
     return selected_results
 
 
+def _select_complete_rollout_groups(args, results, need_length):
+    """Keep only prompt groups with every requested rollout attempt present."""
+
+    grouped = {}
+    for record in results:
+        grouped.setdefault(record["instance_id"], []).append(record)
+
+    expected_size = args.n_samples_per_prompt
+    complete_records = []
+    incomplete_groups = {}
+    for instance_id, group_records in grouped.items():
+        if len(group_records) == expected_size:
+            complete_records.extend(group_records)
+        else:
+            incomplete_groups[instance_id] = len(group_records)
+
+    return select_rollout_data(args, complete_records, need_length), incomplete_groups
+
+
 def log_raw_info(args, all_meta_info, rollout_id):
     if not all_meta_info:
         return
@@ -405,6 +424,8 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer, evaluation:
         retry_times = 0
         results = []
         all_meta_info = []
+        selected_results = []
+        incomplete_groups = {}
 
         if args.fetch_trajectory_retry_times == -1:
             print(
@@ -412,13 +433,19 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer, evaluation:
             )
         while args.fetch_trajectory_retry_times == -1 or retry_times < args.fetch_trajectory_retry_times:
             try:
-                while len(results) < data_number_to_fetch:
+                while len(selected_results) < groups_to_fetch:
                     time.sleep(5)
                     data, meta_info = await get_rollout_data(api_base_url=base_url)
                     results.extend(data)
                     if meta_info:
                         all_meta_info.append(meta_info)
-                    print(f"get rollout data with length: {len(results)}")
+                    selected_results, incomplete_groups = _select_complete_rollout_groups(
+                        args, results, groups_to_fetch
+                    )
+                    print(
+                        "get rollout data with "
+                        f"{len(results)} records, {len(selected_results)} complete prompt groups"
+                    )
                 break
             except Exception as err:
                 print(f"[get_rollout_data] Failed to get rollout data: {err}, retry times: {retry_times}")
@@ -426,8 +453,19 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer, evaluation:
 
         log_raw_info(args, all_meta_info, rollout_id)
 
-        # Apply group-based data selection if there are too many samples
-        results = select_rollout_data(args, results, data_number_to_fetch // args.n_samples_per_prompt)
+        if len(selected_results) < groups_to_fetch:
+            raise RuntimeError(
+                "Insufficient complete rollout groups: "
+                f"got {len(selected_results)}, expected {groups_to_fetch}; "
+                f"incomplete_groups={incomplete_groups}"
+            )
+        if incomplete_groups:
+            print(
+                "Skipping incomplete rollout groups until they receive all "
+                f"{args.n_samples_per_prompt} attempts: {incomplete_groups}"
+            )
+
+        results = selected_results
 
         if len(all_meta_info) > 0 and "finished_groups" in all_meta_info[0]:
             finished_groups_instance_id_list = []
@@ -444,7 +482,7 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer, evaluation:
             for record in group_record:
                 if "samples" in record:
                     compact_samples = [Sample.from_dict(item) for item in record["samples"]]
-                    group_results.append(compact_samples)
+                    group_results.extend(compact_samples)
                     continue
 
                 oai_messages = record["messages"]
@@ -472,8 +510,19 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer, evaluation:
                         metadata={**record["extra_info"]},
                     )
                 )
+            if len(group_results) < args.n_samples_per_prompt:
+                print(
+                    "Skipping prompt group with insufficient trainable samples: "
+                    f"got {len(group_results)}, expected at least {args.n_samples_per_prompt}"
+                )
+                continue
             sample_results.append(group_results)
 
+        if len(sample_results) < groups_to_fetch:
+            raise RuntimeError(
+                "Complete rollout groups produced too few trainable sample groups: "
+                f"got {len(sample_results)}, expected {groups_to_fetch}"
+            )
         data_buffer.add_samples(sample_results)
         final_return_results = data_buffer.get_samples(args.rollout_batch_size)  # type: ignore
 
