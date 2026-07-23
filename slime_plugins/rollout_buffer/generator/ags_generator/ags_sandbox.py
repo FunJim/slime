@@ -94,12 +94,12 @@ class AGSSandbox:
 
     @staticmethod
     def _resources() -> dict[str, str]:
-        raw = _env("AGS_SANDBOX_RESOURCES_JSON", '{"cpu":"4","memory":"16Gi"}')
+        raw = _env("AGS_SANDBOX_RESOURCES_JSON", '{"cpu":"2","memory":"4Gi"}')
         try:
             parsed = json.loads(raw)
-            return parsed if isinstance(parsed, dict) else {"cpu": "4", "memory": "16Gi"}
+            return parsed if isinstance(parsed, dict) else {"cpu": "2", "memory": "4Gi"}
         except Exception:
-            return {"cpu": "4", "memory": "16Gi"}
+            return {"cpu": "2", "memory": "4Gi"}
 
     def _custom_config(self) -> dict[str, Any]:
         return {

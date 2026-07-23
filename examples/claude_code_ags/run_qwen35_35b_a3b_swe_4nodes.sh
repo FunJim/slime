@@ -53,7 +53,7 @@ ROLLOUT_MAX_PROMPT_LEN="${ROLLOUT_MAX_PROMPT_LEN:-${MAX_CONTEXT_LEN}}"
 
 # ============ eval ============
 EVAL_INTERVAL="${EVAL_INTERVAL:-20}"
-EVAL_DATA="${EVAL_DATA:-/data_train/ericxjzheng/data/SWE-bench_Verified_slime_rl_eval/swebench_verified_from_yulei_filtered_slime.jsonl}"
+EVAL_DATA="${EVAL_DATA:-/data_train/ericxjzheng/data/SWE-bench_Verified_slime_rl_format_from_harbor/swebench_verified_slime_tcr.jsonl}"
 SKIP_EVAL_BEFORE_TRAIN="${SKIP_EVAL_BEFORE_TRAIN:-1}"
 N_SAMPLES_PER_EVAL_PROMPT="${N_SAMPLES_PER_EVAL_PROMPT:-1}"
 
@@ -94,7 +94,7 @@ export SWE_AGENT="${SWE_AGENT:-claude_code}"
 export E2B_DOMAIN="${E2B_DOMAIN:-ap-shanghai.tencentags.com}"
 export AGS_BASE_TOOL="${AGS_BASE_TOOL:-sdt-3fzh6mv6}"
 export AGS_IMAGE_REGISTRY_TYPE="${AGS_IMAGE_REGISTRY_TYPE:-enterprise}"
-export AGS_SANDBOX_RESOURCES_JSON=${AGS_SANDBOX_RESOURCES_JSON:-'{"cpu":"4","memory":"16Gi"}'}
+export AGS_SANDBOX_RESOURCES_JSON=${AGS_SANDBOX_RESOURCES_JSON:-'{"cpu":"2","memory":"4Gi"}'}
 
 # ADAPTER_PUBLIC_HOST must be routable from inside the AGS sandbox (not 127.0.0.1).
 export ADAPTER_PUBLIC_HOST="${ADAPTER_PUBLIC_HOST:-${MASTER_ADDR:-${MLP_WORKER_0_HOST:-127.0.0.1}}}"
@@ -176,8 +176,8 @@ EVAL_ARGS=(
    --n-samples-per-eval-prompt "${N_SAMPLES_PER_EVAL_PROMPT}"
    --eval-max-prompt-len "${ROLLOUT_MAX_PROMPT_LEN}"
    --eval-max-response-len "${MAX_GEN_LEN}"
-   --eval-temperature 0.6
-   --eval-top-p 0.95
+   --eval-temperature 0.7
+   --eval-top-p 0.8
    --eval-top-k 20
 )
 
