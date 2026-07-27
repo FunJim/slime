@@ -2,6 +2,7 @@ import copy
 import glob
 import importlib.util
 import json
+import os
 import pathlib
 import threading
 import time
@@ -461,7 +462,7 @@ if __name__ == "__main__":
     uvicorn.run(
         app,
         host="0.0.0.0",
-        port=8889,
+        port=int(os.environ.get("ROLLOUT_BUFFER_PORT", "8889")),
         limit_concurrency=1000,  # Connection concurrency limit
         # limit_max_requests=1000000,  # Maximum request limit
         timeout_keep_alive=5,  # Keep-alive timeout,
