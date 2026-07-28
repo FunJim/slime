@@ -21,11 +21,7 @@ class AGSSidecarClaudeCodeHarness(BaseHarness):
     name = "claude_code"
     extra_args_env = "SLIME_AGENT_CC_EXTRA_ARGS"
     extra_envs_env = "SLIME_AGENT_CC_EXTRA_ENVS"
-    launch_flags = (
-        "--dangerously-skip-permissions "
-        "--verbose --output-format stream-json "
-        "--include-partial-messages --include-hook-events"
-    )
+    launch_flags = "--dangerously-skip-permissions --verbose --output-format stream-json --include-partial-messages --include-hook-events"
     static_env = {
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
         "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
@@ -43,11 +39,7 @@ class AGSSidecarClaudeCodeHarness(BaseHarness):
     async def write_config(self, sb: Sandbox, ctx: HarnessContext) -> None:
         settings = json.dumps({"hasCompletedOnboarding": True, "bypassPermissionsModeAccepted": True})
         await sb.exec(
-            "mkdir -p /root/.claude /home/agent/.claude && "
-            f"echo {shlex.quote(settings)} | tee "
-            "/root/.claude.json /root/.claude/settings.json "
-            "/home/agent/.claude.json /home/agent/.claude/settings.json > /dev/null && "
-            "chown -R agent:agent /home/agent/.claude /home/agent/.claude.json",
+            f"mkdir -p /root/.claude /home/agent/.claude && echo {shlex.quote(settings)} | tee /root/.claude.json /root/.claude/settings.json /home/agent/.claude.json /home/agent/.claude/settings.json > /dev/null && chown -R agent:agent /home/agent/.claude /home/agent/.claude.json",
             user="root",
             check=True,
             timeout=60,
@@ -182,6 +174,7 @@ class CodeBuddyCodeHarness(BaseHarness):
             "fileCheckpointingEnabled": False,
             "promptSuggestionEnabled": False,
             "enableAllProjectMcpServers": False,
+            "memory": {"autoMemoryEnabled": False},
         }
         models_b64 = _json_b64(models_json)
         settings_b64 = _json_b64(settings_json)
@@ -220,13 +213,7 @@ class CodeBuddyCodeHarness(BaseHarness):
         parts.append("-y")
 
         session_log_dir = f"{ctx.workdir}/.harness/codebuddy_sessions"
-        raw_cmd = (
-            f"cbc {' '.join(parts)} {shlex.quote(prompt)}; "
-            "rc=$?; "
-            f"mkdir -p {shlex.quote(session_log_dir)}/projects; "
-            f"cp -r /root/.codebuddy/projects/. {shlex.quote(session_log_dir)}/projects/ 2>/dev/null || true; "
-            "exit $rc"
-        )
+        raw_cmd = f"cbc {' '.join(parts)} {shlex.quote(prompt)}; rc=$?; mkdir -p {shlex.quote(session_log_dir)}/projects; cp -r /root/.codebuddy/projects/. {shlex.quote(session_log_dir)}/projects/ 2>/dev/null || true; exit $rc"
         cmd = f"bash -lc {shlex.quote(raw_cmd)}"
 
         env = {
