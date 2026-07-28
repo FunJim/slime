@@ -5,6 +5,20 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+# What to do when the agent exits 0 but leaves no diff.
+#   "off"     -- skip the check entirely
+#   "metrics" -- label the samples and count it; no behaviour change (default)
+#   "abort"   -- additionally drop the rollout via Sample.Status.ABORTED
+#
+# "abort" is deliberately not the default. An empty-patch trajectory still holds
+# real on-policy tokens whose reward of 0 is correct, i.e. the negative half of
+# a GRPO group; at the observed ~33% empty-patch rate, masking those out biases
+# the group baseline toward successes. It also only requeues under
+# slime.rollout.fully_async_rollout -- on the rollout_buffer path the AGS
+# scripts actually use, an aborted sample is shipped with its loss masked and
+# never retried.
+EMPTY_PATCH_GUARD_POLICIES = frozenset({"off", "metrics", "abort"})
+
 
 @dataclass(frozen=True)
 class AGSGeneratorConfig:
@@ -24,6 +38,7 @@ class AGSGeneratorConfig:
     artifact_dir: str | None
     enable_token2text: bool
     prompt: str
+    empty_patch_guard: str
 
     @classmethod
     def from_env(cls, *, enable_token2text: bool = False) -> AGSGeneratorConfig:
@@ -52,7 +67,20 @@ class AGSGeneratorConfig:
                 "SWE_CC_PROMPT",
                 "Read PROBLEM_STATEMENT.md in the current directory and resolve the issue. Edit source files only (do NOT touch tests). After editing, run the relevant tests to verify your fix passes. Do NOT modify PROBLEM_STATEMENT.md and do NOT commit. When finished, print a one-line summary and exit.",
             ),
+            empty_patch_guard=_empty_patch_guard_policy(os.environ.get("SWE_EMPTY_PATCH_GUARD")),
         )
+
+
+def _empty_patch_guard_policy(raw: str | None) -> str:
+    """Validate SWE_EMPTY_PATCH_GUARD, defaulting to "metrics".
+
+    Raising here fails the run at construction time; silently falling back to a
+    default would disable the guard on a typo without anyone noticing.
+    """
+    policy = (raw or "metrics").strip().lower()
+    if policy not in EMPTY_PATCH_GUARD_POLICIES:
+        raise ValueError(f"SWE_EMPTY_PATCH_GUARD={raw!r} is not one of {sorted(EMPTY_PATCH_GUARD_POLICIES)}")
+    return policy
 
 
 def _env_flag(name: str, *, default: bool) -> bool:

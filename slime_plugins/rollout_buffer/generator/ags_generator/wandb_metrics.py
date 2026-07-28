@@ -170,6 +170,7 @@ def _compute_ags_metrics(args: Any, samples: Iterable[Sample]) -> dict[str, floa
     metrics |= _artifact_metrics(metadata, n)
     metrics |= _runtime_metrics(metadata, n)
     metrics |= _abort_reason_metrics(metadata, n)
+    metrics |= _guardrail_metrics(metadata, n)
     metrics |= _rollout_level_metrics(samples, rewards)
     metrics |= _agent_metrics(samples, metadata, rewards)
     return metrics
@@ -246,6 +247,32 @@ def _abort_reason_metrics(metadata: list[dict[str, Any]], n: int) -> dict[str, f
         metrics[f"abort_reason/{key}/rate"] = _ratio(count, n)
     metrics["abort_reason/total_count"] = sum(reasons.values())
     metrics["abort_reason/total_rate"] = _ratio(sum(reasons.values()), n)
+    return metrics
+
+
+def _guardrail_metrics(metadata: list[dict[str, Any]], n: int) -> dict[str, float | int]:
+    """Counters for silent-failure guardrails.
+
+    ``empty_patch`` counts rollouts that reported success with no diff, split by
+    the reason label -- the failure mode where a coding-agent CLI accepts a
+    text-only mid-task turn as a finished answer. ``ill_formed`` is surfaced
+    alongside it because the trajectory manager has always recorded it and it
+    never had a metrics outlet.
+    """
+    metrics: dict[str, float | int] = {}
+
+    triggered = [md for md in metadata if _safe_bool(md.get("empty_patch_guard_triggered"))]
+    metrics["guardrail/empty_patch/count"] = len(triggered)
+    metrics["guardrail/empty_patch/rate"] = _ratio(len(triggered), n)
+    for reason, count in sorted(
+        Counter(str(md.get("empty_patch_guard_reason") or "unknown") for md in triggered).items()
+    ):
+        metrics[f"guardrail/empty_patch/{_bucket(reason)}/count"] = count
+        metrics[f"guardrail/empty_patch/{_bucket(reason)}/rate"] = _ratio(count, n)
+
+    ill_formed = sum(1 for md in metadata if _safe_bool(md.get("ill_formed")))
+    metrics["guardrail/ill_formed/count"] = ill_formed
+    metrics["guardrail/ill_formed/rate"] = _ratio(ill_formed, n)
     return metrics
 
 

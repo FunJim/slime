@@ -18,6 +18,7 @@ from .adapter_service import AdapterService, RemoteAdapterService
 from .ags_sandbox import AGSSandbox
 from .artifacts import ArtifactWriter, sample_artifact_id
 from .config import AGSGeneratorConfig
+from .empty_patch_guard import GuardVerdict, classify_empty_patch
 from .harnesses import resolve_agent
 from .sampling import normalize_sampling_params
 from .swe_task import evaluate, get_metadata, git_diff, prepare_workspace
@@ -102,6 +103,12 @@ class AGSRolloutRunner:
                     )
                     trajectory_path = await self.artifacts.dump_trajectory(sb, md["workdir"], artifact_id)
                     diff_text = await git_diff(sb, md["workdir"])
+                    guard_verdict = self._check_empty_patch(
+                        agent_exit_code=agent_exit_code,
+                        diff_text=diff_text,
+                        trajectory_path=trajectory_path,
+                        instance_id=instance_id,
+                    )
                     patch_path = self.artifacts.dump_patch(diff_text, artifact_id)
                     if not self.config.eval_isolated_sandbox:
                         reward, applied_cleanly = await evaluate(
@@ -116,6 +123,13 @@ class AGSRolloutRunner:
                         diff_text=diff_text,
                         **evaluation_args,
                     )
+                # Must come before finish_session: that call drains the session
+                # and is idempotent, so a later return would yield no samples.
+                if guard_verdict.triggered and self.config.empty_patch_guard == "abort":
+                    samples = self._abort_result(base_sample, guard_verdict.reason, instance_id)
+                    self.weave_trace.finish_rollout(trace_call, samples=samples, trajectory_path=trajectory_path)
+                    return samples
+
                 samples = await self.adapter_service.adapter.finish_session(
                     session_id,
                     base_sample=base_sample,
@@ -143,6 +157,10 @@ class AGSRolloutRunner:
                         "num_samples": len(samples),
                         "patch_path": patch_path,
                         "trajectory_path": trajectory_path,
+                        "empty_patch_guard_triggered": guard_verdict.triggered,
+                        "empty_patch_guard_reason": guard_verdict.reason,
+                        # Excerpt goes in the dump only; sample metadata stays small.
+                        "empty_patch_final_text": guard_verdict.final_text,
                     },
                     artifact_id,
                 )
@@ -160,6 +178,8 @@ class AGSRolloutRunner:
                         "ags_elapsed_sec": elapsed_sec,
                         "ags_num_samples": len(samples),
                         "ags_rollout_concurrency": self.config.rollout_concurrency,
+                        "empty_patch_guard_triggered": guard_verdict.triggered,
+                        "empty_patch_guard_reason": guard_verdict.reason,
                     }
                 logger.info(
                     "[ags_generator] %s: reward=%.2f applied=%s eval_isolated=%s exit=%s elapsed=%.1fs segments=%d",
@@ -211,6 +231,41 @@ class AGSRolloutRunner:
                         session_id,
                         traceback.format_exc(),
                     )
+
+    def _check_empty_patch(
+        self,
+        *,
+        agent_exit_code: int,
+        diff_text: str,
+        trajectory_path: str | None,
+        instance_id: str,
+    ) -> GuardVerdict:
+        """Classify an exit-0-but-no-diff rollout; never raises.
+
+        Classification failure must not cost us an otherwise usable rollout, so
+        anything unexpected degrades to "not triggered" rather than propagating
+        into the caller's generic exception handler (which would abort).
+        """
+        if self.config.empty_patch_guard == "off":
+            return GuardVerdict(triggered=False)
+        try:
+            verdict = classify_empty_patch(
+                agent_exit_code=agent_exit_code,
+                diff_text=diff_text,
+                trajectory_path=trajectory_path,
+                agent=self.config.agent_name,
+            )
+        except Exception:
+            logger.warning("[ags_generator] %s: empty patch guard failed", instance_id, exc_info=True)
+            return GuardVerdict(triggered=False)
+        if verdict.triggered:
+            logger.warning(
+                "[ags_generator] %s: empty patch guard: %s (policy=%s)",
+                instance_id,
+                verdict.reason,
+                self.config.empty_patch_guard,
+            )
+        return verdict
 
     @asynccontextmanager
     async def _boot_agent_sandbox(self, image: str, instance_id: str) -> AsyncIterator[AGSSandbox]:

@@ -748,6 +748,10 @@ jobs:
             {
               "num_gpus": 0,
               "test_file": "test_rollout_buffer/test_ags_prompt_source.py"
+            },
+            {
+              "num_gpus": 0,
+              "test_file": "test_rollout_buffer/test_ags_empty_patch_guard.py"
             }
           ]
     defaults:
