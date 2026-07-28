@@ -16,11 +16,23 @@ class AGSPromptSource:
         self.args = args
         self.data_source = RolloutDataSource(args)
         start_group = int(getattr(args, "rollout_start_group", 0) or 0)
-        if start_group > 0 and self.data_source.dataset is not None:
-            dataset_len = len(self.data_source.dataset)
-            self.data_source.sample_offset = start_group % dataset_len if dataset_len else 0
+        dataset = self.data_source.dataset
+        if start_group > 0 and dataset is not None and len(dataset) > 0:
+            # There is no generator-side checkpoint: the trainer identifies the
+            # position by absolute group index (rollout_id * rollout_batch_size),
+            # so seek to it. Group index g lives at offset g % len in epoch
+            # g // len, mirroring how RolloutDataSource.get_samples advances the
+            # offset by one per group and bumps the epoch on each wraparound.
+            dataset_len = len(dataset)
+            self.data_source.sample_offset = start_group % dataset_len
+            self.data_source.epoch_id = start_group // dataset_len
             self.data_source.sample_group_index = start_group
             self.data_source.sample_index = start_group * int(args.n_samples_per_prompt)
+            if args.rollout_shuffle:
+                # Each epoch has its own seeded permutation; without this the
+                # samples stay on epoch 0's order after a wraparound and the
+                # prompt sequence diverges from the uninterrupted run.
+                dataset.shuffle(self.data_source.epoch_id)
 
     def get_groups(self, num_groups: int) -> list[list[Sample]]:
         groups = self.data_source.get_samples(num_groups)
