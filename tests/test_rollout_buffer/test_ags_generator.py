@@ -10,10 +10,12 @@ import types
 from types import SimpleNamespace
 
 import pytest
+from aiohttp import web
 from tests.test_agent._fakes import FakeSandbox
 
+from slime.utils.misc import SingletonMeta
 from slime.utils.types import Sample
-from slime_plugins.rollout_buffer.generator.ags_generator import swe_task
+from slime_plugins.rollout_buffer.generator.ags_generator import adapter_service, swe_task
 from slime_plugins.rollout_buffer.generator.ags_generator.config import AGSGeneratorConfig
 from slime_plugins.rollout_buffer.generator.ags_generator.entry import (
     _collapse_eval_samples,
@@ -120,6 +122,144 @@ def test_eval_isolated_sandbox_can_be_enabled(monkeypatch):
     monkeypatch.setenv("SWE_EVAL_ISOLATED_SANDBOX", "true")
 
     assert AGSGeneratorConfig.from_env().eval_isolated_sandbox is True
+
+
+def _adapter_args(**overrides):
+    args = SimpleNamespace(
+        hf_checkpoint="/models/fake",
+        rollout_max_context_len=4096,
+        sglang_tool_call_parser="qwen3_coder",
+        sglang_reasoning_parser="qwen3",
+        sglang_router_ip="127.0.0.1",
+        sglang_router_port=30000,
+    )
+    for key, value in overrides.items():
+        setattr(args, key, value)
+    return args
+
+
+def test_eval_falls_back_to_a_local_adapter_when_none_is_running(monkeypatch):
+    """Eval must not require the training rollout to have built the adapter.
+
+    Under --num-rollout 0, or eval-before-train on rollout 0, nothing has bound
+    ADAPTER_PORT yet, so a RemoteAdapterProxy would fail every prompt with a
+    connection error. Fall back to a local adapter on an ephemeral port.
+    """
+    monkeypatch.setenv("ADAPTER_PUBLIC_HOST", "10.0.0.1")
+    monkeypatch.delenv("ADAPTER_PUBLIC_BASE_URL", raising=False)
+    monkeypatch.delenv("AGS_EVAL_ADAPTER_CONTROL_URL", raising=False)
+    monkeypatch.delenv("ADAPTER_CONTROL_BASE_URL", raising=False)
+    monkeypatch.setattr(adapter_service, "_remote_adapter_alive", lambda *a, **k: False)
+    built: dict = {}
+
+    def _fake_local(args, config, adapter_cls, *, port=None):
+        built["port"] = port
+        return SimpleNamespace(kind="local")
+
+    monkeypatch.setattr(adapter_service, "_local_adapter_service", _fake_local)
+
+    service = adapter_service.get_adapter_service(
+        _adapter_args(), AGSGeneratorConfig.from_env(), object, evaluation=True
+    )
+
+    assert service.kind == "local"
+    # Ephemeral: the training adapter may still claim ADAPTER_PORT later in the run.
+    assert built["port"] == 0
+
+
+def test_eval_reuses_the_training_adapter_when_one_is_live(monkeypatch):
+    """The live training adapter owns the trajectory trees, so prefer it."""
+    monkeypatch.setenv("ADAPTER_PUBLIC_HOST", "10.0.0.1")
+    monkeypatch.delenv("ADAPTER_PUBLIC_BASE_URL", raising=False)
+    monkeypatch.setattr(adapter_service, "_remote_adapter_alive", lambda *a, **k: True)
+    monkeypatch.setattr(
+        adapter_service,
+        "_local_adapter_service",
+        lambda *a, **k: pytest.fail("must not start a local adapter when one is already live"),
+    )
+    monkeypatch.setattr(adapter_service, "RemoteAdapterService", lambda args, config: SimpleNamespace(kind="remote"))
+
+    service = adapter_service.get_adapter_service(
+        _adapter_args(), AGSGeneratorConfig.from_env(), object, evaluation=True
+    )
+
+    assert service.kind == "remote"
+
+
+def test_training_never_probes_for_a_remote_adapter(monkeypatch):
+    """Training owns its adapter; it must not depend on a health probe."""
+    monkeypatch.setenv("ADAPTER_PUBLIC_HOST", "10.0.0.1")
+    monkeypatch.setattr(
+        adapter_service,
+        "_remote_adapter_alive",
+        lambda *a, **k: pytest.fail("training must not probe for a remote adapter"),
+    )
+    monkeypatch.setattr(
+        adapter_service, "_local_adapter_service", lambda *a, **k: SimpleNamespace(kind="local", port=k.get("port"))
+    )
+
+    service = adapter_service.get_adapter_service(
+        _adapter_args(), AGSGeneratorConfig.from_env(), object, evaluation=False
+    )
+
+    assert service.kind == "local"
+
+
+def test_ephemeral_eval_adapter_advertises_its_own_node_and_port(monkeypatch):
+    """The fallback adapter must not advertise the head node's host:port.
+
+    It runs in the RolloutManager actor, which Ray does not pin to the head, so
+    ADAPTER_PUBLIC_HOST/ADAPTER_PUBLIC_BASE_URL (head + fixed port) would send
+    sandboxes to the wrong address. Only the fixed-port path may use them.
+    """
+    from slime.utils.http_utils import get_host_info
+
+    monkeypatch.setenv("ADAPTER_PUBLIC_HOST", "10.255.255.1")
+    monkeypatch.setenv("ADAPTER_PUBLIC_BASE_URL", "http://10.255.255.1:18001")
+    monkeypatch.setenv("ADAPTER_PORT", "18903")
+    monkeypatch.setattr(adapter_service, "load_tokenizer", lambda *a, **k: SimpleNamespace())
+
+    class _StubAdapter:
+        def __init__(self, **kwargs):
+            self.app = web.Application()
+
+    config = AGSGeneratorConfig.from_env()
+    SingletonMeta.clear_instances(adapter_service.AdapterService)
+    try:
+        ephemeral = adapter_service._local_adapter_service(_adapter_args(), config, _StubAdapter, port=0)
+        assert ephemeral.adapter_url == f"http://{get_host_info()[1]}:{ephemeral.app_handle.port}"
+        assert ephemeral.app_handle.port not in (0, config.adapter_port)
+
+        SingletonMeta.clear_instances(adapter_service.AdapterService)
+        fixed = adapter_service._local_adapter_service(_adapter_args(), config, _StubAdapter)
+        assert fixed.adapter_url == "http://10.255.255.1:18001"
+    finally:
+        SingletonMeta.clear_instances(adapter_service.AdapterService)
+
+
+def test_reusing_the_adapter_singleton_warns_when_args_differ(monkeypatch, caplog):
+    """AdapterService is a singleton: later callers' args are silently ignored.
+
+    A mismatch means the live adapter was built with a different tokenizer or
+    context budget than this caller asked for, which would otherwise be invisible.
+    """
+    monkeypatch.setenv("ADAPTER_PUBLIC_HOST", "10.0.0.1")
+    config = AGSGeneratorConfig.from_env()
+    first = _adapter_args()
+    live = SimpleNamespace(
+        build_key=adapter_service._adapter_build_key(first, config, object, "http://127.0.0.1:30000")
+    )
+    monkeypatch.setattr(adapter_service, "AdapterService", lambda *a, **k: live)
+
+    with caplog.at_level("WARNING"):
+        same = adapter_service._local_adapter_service(first, config, object)
+    assert same is live
+    assert not caplog.records, "identical args must not warn"
+
+    with caplog.at_level("WARNING"):
+        adapter_service._local_adapter_service(_adapter_args(rollout_max_context_len=131072), config, object)
+
+    assert any("singleton" in r.message for r in caplog.records)
 
 
 _MD = {"instance_id": "x__1", "dataset_prompt": "# Task\n\nFix the bug.", "problem_statement": "Fix the bug."}

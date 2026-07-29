@@ -416,8 +416,72 @@ def test_openai_manager_message_keeps_text_and_reasoning_with_tool_calls():
 
 
 # ===========================================================================
-# §6 adapter behaviour: turn cap, mid-list system fold
+# §6 adapter behaviour: turn cap, mid-list system fold, sampling precedence
 # ===========================================================================
+
+
+def test_open_session_sampling_defaults_outrank_body():
+    """A caller-set temperature must survive a harness that sends its own.
+
+    codebuddy puts temperature=1 on every /v1/chat/completions request, so
+    without this precedence an --eval-temperature would never reach sglang.
+    """
+
+    async def run_case():
+        async with FakeSGLangServer([[(-0.1, 601)]]) as sglang:
+            tok = FakeTokenizer(outputs={(601,): "ok"})
+            adapter = openai.OpenAIAdapter(tokenizer=tok, sglang_url=sglang.url)
+            adapter.open_session("sid-sp", sampling_defaults={"temperature": 0.7, "top_p": 0.8})
+            client = TestClient(TestServer(adapter.app))
+            await client.start_server()
+            try:
+                await client.post(
+                    "/v1/chat/completions",
+                    headers={"Authorization": "Bearer sid-sp"},
+                    # temperature/top_k as a harness would send them; top_k is
+                    # absent from the defaults so the body value still applies.
+                    json={
+                        "model": "m",
+                        "temperature": 1,
+                        "top_k": 40,
+                        "messages": [{"role": "user", "content": "hi"}],
+                    },
+                )
+            finally:
+                await client.close()
+            await _drain(adapter, "sid-sp")
+
+        sp = sglang.requests[0]["sampling_params"]
+        assert sp["temperature"] == 0.7, "body temperature must not override the caller's default"
+        assert sp["top_p"] == 0.8
+        assert sp["top_k"] == 40, "keys absent from sampling_defaults still come from the body"
+
+    asyncio.run(run_case())
+
+
+def test_body_sampling_params_apply_without_open_session_defaults():
+    """With no caller defaults, the harness's own knobs are still honoured."""
+
+    async def run_case():
+        async with FakeSGLangServer([[(-0.1, 602)]]) as sglang:
+            tok = FakeTokenizer(outputs={(602,): "ok"})
+            adapter = openai.OpenAIAdapter(tokenizer=tok, sglang_url=sglang.url)
+            adapter.open_session("sid-nd")
+            client = TestClient(TestServer(adapter.app))
+            await client.start_server()
+            try:
+                await client.post(
+                    "/v1/chat/completions",
+                    headers={"Authorization": "Bearer sid-nd"},
+                    json={"model": "m", "temperature": 0.3, "messages": [{"role": "user", "content": "hi"}]},
+                )
+            finally:
+                await client.close()
+            await _drain(adapter, "sid-nd")
+
+        assert sglang.requests[0]["sampling_params"]["temperature"] == 0.3
+
+    asyncio.run(run_case())
 
 
 def test_max_turns_per_sid_returns_429():

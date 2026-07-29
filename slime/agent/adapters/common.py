@@ -458,9 +458,17 @@ def _sampling_params(session: Any, body: dict, *, max_token_keys: tuple[str, ...
             sp["max_new_tokens"] = min(int(sp.get("max_new_tokens", body[key])), int(body[key]))
             break
 
-    for src_k, dst_k in (("temperature", "temperature"), ("top_p", "top_p"), ("top_k", "top_k")):
-        if src_k in body:
-            sp[dst_k] = body[src_k]
+    # The CLI's own sampling knobs only apply where the caller left that key
+    # unset. open_session's sampling_defaults carry the trainer's temperature /
+    # top_p / top_k (eval uses different values than training), and a harness
+    # that hardcodes its own would otherwise silently override them: codebuddy
+    # sends temperature=1 on every /v1/chat/completions request, so an
+    # --eval-temperature would never reach sglang. Claude Code sends none of
+    # these three, which is why this only ever bit the codebuddy path.
+    defaults = session.sampling_defaults or {}
+    for key in ("temperature", "top_p", "top_k"):
+        if key in body and key not in defaults:
+            sp[key] = body[key]
 
     for key in stop_keys:
         if body.get(key):

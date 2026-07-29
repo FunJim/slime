@@ -36,6 +36,12 @@ class _AGSGenerateState(metaclass=SingletonMeta):
         self.config = AGSGeneratorConfig.from_env(
             enable_token2text=_as_bool(getattr(args, "enable_token2text", False))
         )
+        # This singleton is keyed on the class, not on `evaluation`, so the first
+        # caller's mode does fix the runner's adapter for the process. That is
+        # harmless: one adapter serves both modes (sessions are keyed by sid),
+        # and get_adapter_service falls back to a local adapter when the training
+        # one is absent. The prompt style, which must differ per call, is passed
+        # to generate() instead of being read off the runner.
         self.runner = AGSRolloutRunner(args, self.config, use_remote_adapter=evaluation)
         self.semaphore = asyncio.Semaphore(self.config.rollout_concurrency)
 

@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 
 from slime.utils.types import Sample
 
-from .adapter_service import AdapterService, RemoteAdapterService
+from .adapter_service import get_adapter_service
 from .ags_sandbox import AGSSandbox
 from .artifacts import ArtifactWriter, sample_artifact_id
 from .config import AGSGeneratorConfig
@@ -38,10 +38,17 @@ class AGSRolloutRunner:
         self.args = args
         self.config = config or AGSGeneratorConfig.from_env()
         self.harness_cls, self.adapter_cls = resolve_agent(self.config.agent_name)
-        if use_remote_adapter:
-            self.adapter_service = RemoteAdapterService(args, self.config)
-        else:
-            self.adapter_service = AdapterService(args, self.config, self.adapter_cls)
+        # use_remote_adapter asks to reuse the training adapter rather than bind
+        # a second one on the same port. get_adapter_service downgrades that to a
+        # local adapter when no training adapter is actually running, so
+        # eval-before-train and --num-rollout 0 work instead of failing every
+        # prompt with a connection error.
+        self.adapter_service = get_adapter_service(
+            args,
+            self.config,
+            self.adapter_cls,
+            evaluation=use_remote_adapter,
+        )
         self.artifacts = ArtifactWriter(self.config.artifact_dir)
         self.weave_trace = AGSWeaveTrace(
             args,
