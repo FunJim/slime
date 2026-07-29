@@ -9,6 +9,10 @@ checkpoint required. The code under test stays real; only these edges are faked:
                                   round-trips (``decode(encode(t)) == t``), so a
                                   scripted model reply survives the
                                   encode->generate->decode->parse round trip.
+  * :class:`RoundTrippingTokenizer` -- same, but renders assistant turns back
+                                  into the model's own surface form (tool calls
+                                  included), so a clean multi-turn chain stays
+                                  drift-free and only real drift shows up.
   * :class:`ScriptedTokenizer` -- pre-baked prompt-id queue + id->text decode,
                                   for adapter unit tests that assert exact ids.
   * :class:`FakeSGLangServer`  -- a real aiohttp ``/generate`` upstream returning
@@ -106,6 +110,78 @@ class FakeTokenizer:
             role = m.get("role", "user")
             out.append(_ROLE_BEGIN.get(role, _ROLE_BEGIN["user"]))
             out.extend(self.encode(self._content_text(m)))
+            out.append(_ROLE_END)
+        if add_generation_prompt:
+            out.append(_GEN)
+        return out
+
+
+class RoundTrippingTokenizer:
+    """Tokenizer whose assistant rendering is reproducible from model output.
+
+    :class:`FakeTokenizer` renders a tool call as the opaque marker
+    ``toolcall:<name>``, which carries no arguments and which no model output can
+    ever reproduce. That is fine for tests asserting ids, but it makes every
+    tool-call turn look like token drift -- so it cannot be used to test whether
+    the manager sees a *clean* multi-turn chain.
+
+    Here an assistant message renders back into the surface form qwen3-coder
+    actually generates::
+
+        <think>{reasoning}</think> {content} <tool_call><function=NAME>
+        <parameter=K>V</parameter></function></tool_call>
+
+    so a manager leaf that preserves reasoning + text + tool calls re-renders to
+    exactly the ids that were sampled, and any field the leaf *drops* shows up as
+    genuine drift. Words are whitespace-delimited (the real tokenizer is sub-word,
+    which changes id counts but not whether drift occurs).
+    """
+
+    def __init__(self) -> None:
+        self._vocab: dict[str, int] = {}
+        self._inv: dict[int, str] = {}
+        self._next = _WORD_BASE
+
+    def _id(self, word: str) -> int:
+        if word not in self._vocab:
+            self._vocab[word] = self._next
+            self._inv[self._next] = word
+            self._next += 1
+        return self._vocab[word]
+
+    def encode(self, text: str) -> list[int]:
+        return [self._id(w) for w in text.split()] if text else []
+
+    def decode(self, ids, skip_special_tokens: bool = False) -> str:
+        return " ".join(self._inv[i] for i in ids if i in self._inv)
+
+    @staticmethod
+    def render_assistant(message: dict) -> str:
+        """Assistant message -> the model's own surface form (see class docstring)."""
+        parts: list[str] = []
+        reasoning = message.get("reasoning_content")
+        if reasoning:
+            parts.append(f"<think> {reasoning} </think>")
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            parts.append(content)
+        for call in message.get("tool_calls") or []:
+            fn = call.get("function") or {}
+            args = fn.get("arguments") or {}
+            inner = " ".join(f"<parameter={k}> {v} </parameter>" for k, v in args.items())
+            parts.append(f"<tool_call> <function={fn.get('name', 'tool')}> {inner} </function> </tool_call>")
+        return " ".join(parts)
+
+    def apply_chat_template(self, messages, tools=None, tokenize=True, add_generation_prompt=True):
+        out: list[int] = []
+        for m in messages:
+            role = m.get("role", "user")
+            out.append(_ROLE_BEGIN.get(role, _ROLE_BEGIN["user"]))
+            if role == "assistant":
+                out.extend(self.encode(self.render_assistant(m)))
+            else:
+                content = m.get("content")
+                out.extend(self.encode(content if isinstance(content, str) else ""))
             out.append(_ROLE_END)
         if add_generation_prompt:
             out.append(_GEN)
