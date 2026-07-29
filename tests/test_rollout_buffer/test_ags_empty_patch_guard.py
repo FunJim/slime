@@ -193,5 +193,47 @@ def test_empty_patch_guard_policy_rejects_unknown_value(monkeypatch):
         AGSGeneratorConfig.from_env()
 
 
+def test_prompt_styles_default_to_instruction_for_train_and_dataset_for_eval(monkeypatch):
+    monkeypatch.delenv("SWE_PROMPT_STYLE", raising=False)
+    monkeypatch.delenv("SWE_EVAL_PROMPT_STYLE", raising=False)
+    config = AGSGeneratorConfig.from_env()
+    assert config.prompt_style == "instruction"
+    assert config.eval_prompt_style == "dataset"
+
+
+@pytest.mark.parametrize(
+    "env_name,attr", [("SWE_PROMPT_STYLE", "prompt_style"), ("SWE_EVAL_PROMPT_STYLE", "eval_prompt_style")]
+)
+@pytest.mark.parametrize(
+    "value,expected", [("dataset", "dataset"), ("DATASET", "dataset"), ("instruction", "instruction")]
+)
+def test_prompt_style_from_env(monkeypatch, env_name, attr, value, expected):
+    monkeypatch.setenv(env_name, value)
+    assert getattr(AGSGeneratorConfig.from_env(), attr) == expected
+
+
+def test_prompt_styles_are_independent(monkeypatch):
+    """The two knobs must not read each other's env var: sharing one would make
+    the train/eval split silently collapse to whichever was set."""
+    monkeypatch.setenv("SWE_PROMPT_STYLE", "dataset")
+    monkeypatch.setenv("SWE_EVAL_PROMPT_STYLE", "instruction")
+    config = AGSGeneratorConfig.from_env()
+    assert (config.prompt_style, config.eval_prompt_style) == ("dataset", "instruction")
+    assert config.prompt_style_for(evaluation=False) == "dataset"
+    assert config.prompt_style_for(evaluation=True) == "instruction"
+
+
+@pytest.mark.parametrize("env_name", ["SWE_PROMPT_STYLE", "SWE_EVAL_PROMPT_STYLE"])
+@pytest.mark.parametrize("value", ["harbor", "inline"])
+def test_prompt_style_rejects_unknown_value(monkeypatch, env_name, value):
+    # "inline" was removed: it rebuilt the prompt from the raw problem_statement,
+    # which "dataset" now supersedes. Failing loudly beats silently changing the
+    # prompt for a run that still asks for it. The error must name the var that
+    # was actually wrong, or a typo in one sends you looking at the other.
+    monkeypatch.setenv(env_name, value)
+    with pytest.raises(ValueError, match=env_name):
+        AGSGeneratorConfig.from_env()
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

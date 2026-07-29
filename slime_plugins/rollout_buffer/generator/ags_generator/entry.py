@@ -56,11 +56,16 @@ async def generate(
     Training keeps AGSRolloutRunner's trainable segment output. Eval collapses
     the possibly multi-segment trajectory into one scored sample so pass-rate
     metrics count one eval attempt per prompt.
+
+    ``evaluation`` is forwarded to each generate() call rather than baked into the
+    runner: _AGSGenerateState is a singleton, so the first caller's mode would
+    otherwise stick for the life of the process and silently give eval the
+    training prompt style (or vice versa).
     """
 
     state = _AGSGenerateState(args, evaluation=evaluation)
     async with state.semaphore:
-        samples = await state.runner.generate(base_sample, sampling_params)
+        samples = await state.runner.generate(base_sample, sampling_params, evaluation=evaluation)
 
     if not evaluation:
         return samples

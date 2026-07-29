@@ -31,6 +31,10 @@ def get_metadata(sample: Sample) -> dict[str, Any]:
         "image": m.get("image") or rem.get("image_url"),
         "workdir": m.get("workdir") or rem.get("workdir"),
         "problem_statement": m.get("problem_statement") or _coerce_prompt(sample.prompt),
+        # The row's own prompt text. Kept separate from problem_statement so the
+        # "dataset" prompt style forwards exactly what the data carries, even for
+        # rows whose metadata.problem_statement was written by some other producer.
+        "dataset_prompt": _coerce_prompt(sample.prompt),
         "swepro": m.get("swepro"),
         "eval_cmd": m.get("eval_cmd"),
         "f2p_script": rem.get("f2p_script"),
@@ -48,7 +52,17 @@ def _coerce_prompt(prompt) -> str:
     return ""
 
 
-async def prepare_workspace(sb: Sandbox, workdir: str, md: dict[str, Any]) -> None:
+async def prepare_workspace(
+    sb: Sandbox, workdir: str, md: dict[str, Any], *, write_problem_statement: bool = True
+) -> None:
+    """Set up the agent's workspace before the harness runs.
+
+    ``write_problem_statement`` is False under the "dataset" prompt style, whose
+    prompt already carries the task text: writing the file anyway would leave an
+    untracked artifact in the repo that only ``git_diff``'s exclude pathspec keeps
+    out of the patch, and would tempt the agent into spending turns reading a file
+    that merely restates its prompt. Harbor writes no such file either.
+    """
     await agent_sandbox.ensure_agent_user(sb, workdir)
     swepro = md.get("swepro")
     if swepro:
@@ -56,7 +70,8 @@ async def prepare_workspace(sb: Sandbox, workdir: str, md: dict[str, Any]) -> No
     pre_commands = md.get("pre_commands")
     if pre_commands:
         await apply_pre_commands(sb, workdir, pre_commands)
-    await sb.write_file(f"{workdir}/PROBLEM_STATEMENT.md", md.get("problem_statement") or "", user="agent")
+    if write_problem_statement:
+        await sb.write_file(f"{workdir}/PROBLEM_STATEMENT.md", md.get("problem_statement") or "", user="agent")
 
 
 async def apply_before_repo_set_cmd(sb: Sandbox, workdir: str, swepro: dict[str, Any]) -> None:

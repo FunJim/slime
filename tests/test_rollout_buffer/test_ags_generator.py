@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 import re
 import sys
@@ -21,6 +22,7 @@ from slime_plugins.rollout_buffer.generator.ags_generator.entry import (
     transform_group,
 )
 from slime_plugins.rollout_buffer.generator.ags_generator.harnesses import CodeBuddyCodeHarness, resolve_agent
+from slime_plugins.rollout_buffer.generator.ags_generator.rollout import AGSRolloutRunner
 from slime_plugins.rollout_buffer.generator.ags_generator.runner import run_root_command
 from slime_plugins.rollout_buffer.generator.ags_generator.sampling import normalize_sampling_params
 from slime_plugins.rollout_buffer.generator.ags_generator.serialization import (
@@ -118,6 +120,173 @@ def test_eval_isolated_sandbox_can_be_enabled(monkeypatch):
     monkeypatch.setenv("SWE_EVAL_ISOLATED_SANDBOX", "true")
 
     assert AGSGeneratorConfig.from_env().eval_isolated_sandbox is True
+
+
+_MD = {"instance_id": "x__1", "dataset_prompt": "# Task\n\nFix the bug.", "problem_statement": "Fix the bug."}
+
+
+def _async_return(value):
+    """Async callable ignoring its arguments and returning ``value``."""
+
+    async def _call(*args, **kwargs):
+        return value
+
+    return _call
+
+
+@pytest.mark.parametrize(
+    "style,expected_prompt,expects_file",
+    [
+        ("dataset", "# Task\n\nFix the bug.", False),
+        ("instruction", "Read PROBLEM_STATEMENT.md and fix it.", True),
+    ],
+)
+def test_agent_prompt_and_statement_file_agree_per_style(monkeypatch, style, expected_prompt, expects_file):
+    """The prompt style must decide the prompt and the statement file together.
+
+    Wiring these two independently is how you get "instruction" without the file
+    it names, or "dataset" with a stray file in the repo, so both are asserted
+    from one style.
+    """
+    monkeypatch.setenv("SWE_CC_PROMPT", "Read PROBLEM_STATEMENT.md and fix it.")
+    runner = AGSRolloutRunner.__new__(AGSRolloutRunner)  # no sandbox/adapter needed
+    runner.config = AGSGeneratorConfig.from_env()
+
+    assert runner._agent_prompt(_MD, style) == expected_prompt
+
+    async def run_case():
+        sb = FakeSandbox()
+        await swe_task.prepare_workspace(sb, "/testbed", _MD, write_problem_statement=style == "instruction")
+        return sb
+
+    assert ("/testbed/PROBLEM_STATEMENT.md" in asyncio.run(run_case()).files) is expects_file
+
+
+@pytest.mark.parametrize(
+    "evaluation,expected_prompt",
+    [(False, "Read PROBLEM_STATEMENT.md and fix it."), (True, "# Task\n\nFix the bug.")],
+)
+def test_generate_picks_prompt_style_by_rollout_mode(monkeypatch, evaluation, expected_prompt):
+    """Training and eval must resolve to their own style from one config.
+
+    This is the wiring generate() does, exercised end to end from the env vars:
+    the default split is instruction for training, dataset for eval.
+    """
+    monkeypatch.delenv("SWE_PROMPT_STYLE", raising=False)
+    monkeypatch.delenv("SWE_EVAL_PROMPT_STYLE", raising=False)
+    monkeypatch.setenv("SWE_CC_PROMPT", "Read PROBLEM_STATEMENT.md and fix it.")
+    runner = AGSRolloutRunner.__new__(AGSRolloutRunner)
+    runner.config = AGSGeneratorConfig.from_env()
+
+    style = runner.config.prompt_style_for(evaluation=evaluation)
+    assert runner._agent_prompt(_MD, style) == expected_prompt
+
+
+@pytest.mark.parametrize(
+    "evaluation,expected_prompt,expects_file",
+    [(False, "Read PROBLEM_STATEMENT.md and fix it.", True), (True, "# Task\n\nFix the bug.", False)],
+)
+def test_generate_threads_evaluation_flag_to_harness_and_workspace(
+    monkeypatch, evaluation, expected_prompt, expects_file
+):
+    """Drive the real generate() and capture what the harness was handed.
+
+    The helper tests above verify the style→prompt mapping; this one verifies the
+    plumbing, which is the part that silently breaks: generate() must resolve the
+    style from its own `evaluation` argument and use that same value for both the
+    harness prompt and the PROBLEM_STATEMENT.md decision.
+    """
+    monkeypatch.delenv("SWE_PROMPT_STYLE", raising=False)
+    monkeypatch.delenv("SWE_EVAL_PROMPT_STYLE", raising=False)
+    monkeypatch.setenv("SWE_CC_PROMPT", "Read PROBLEM_STATEMENT.md and fix it.")
+
+    captured: dict = {}
+    sandbox = FakeSandbox()
+
+    class _Harness:
+        async def run(self, sb, *, workdir, session_id, adapter_url, time_budget_sec, prompt):
+            captured["prompt"] = prompt
+            return 0
+
+    @contextlib.asynccontextmanager
+    async def _fake_boot(self, image, instance_id):
+        yield sandbox
+
+    runner = AGSRolloutRunner.__new__(AGSRolloutRunner)
+    runner.config = AGSGeneratorConfig.from_env()
+    runner.harness_cls = _Harness
+    runner.artifacts = SimpleNamespace(
+        dump_trajectory=_async_return(None), dump_patch=lambda *a, **k: None, dump_rollout=lambda *a, **k: None
+    )
+    runner.weave_trace = SimpleNamespace(start_rollout=lambda **k: None, finish_rollout=lambda *a, **k: None)
+    # finish_session returning [] short-circuits into _abort_result, which is fine:
+    # the prompt and the workspace file are already decided by then.
+    runner.adapter_service = SimpleNamespace(
+        adapter=SimpleNamespace(
+            open_session=lambda *a, **k: None,
+            finish_session=_async_return([]),
+            drop_session=_async_return(None),
+        ),
+        max_context_len=4096,
+        adapter_url="http://127.0.0.1:1",
+    )
+    monkeypatch.setattr(AGSRolloutRunner, "_boot_agent_sandbox", _fake_boot)
+    monkeypatch.setattr("slime_plugins.rollout_buffer.generator.ags_generator.rollout.git_diff", _async_return(""))
+    monkeypatch.setattr(
+        "slime_plugins.rollout_buffer.generator.ags_generator.rollout.evaluate", _async_return((0.0, True))
+    )
+
+    sample = Sample(
+        index=0,
+        prompt="# Task\n\nFix the bug.",
+        metadata={"instance_id": "x__1", "image": "img", "workdir": "/testbed"},
+    )
+    asyncio.run(runner.generate(sample, {}, evaluation=evaluation))
+
+    assert captured["prompt"] == expected_prompt
+    assert ("/testbed/PROBLEM_STATEMENT.md" in sandbox.files) is expects_file
+
+
+def test_agent_prompt_falls_back_when_dataset_prompt_is_empty(monkeypatch):
+    monkeypatch.setenv("SWE_CC_PROMPT", "fallback prompt")
+    runner = AGSRolloutRunner.__new__(AGSRolloutRunner)
+    runner.config = AGSGeneratorConfig.from_env()
+
+    assert runner._agent_prompt({"instance_id": "x__1", "dataset_prompt": "   "}, "dataset") == "fallback prompt"
+
+
+@pytest.mark.parametrize("write_problem_statement", [True, False])
+def test_prepare_workspace_writes_problem_statement_only_when_asked(write_problem_statement):
+    """Under the "dataset" prompt style the prompt already carries the task text,
+    so PROBLEM_STATEMENT.md must not be created: it would be an untracked file in
+    the repo that only git_diff's exclude pathspec keeps out of the patch."""
+
+    async def run_case():
+        sb = FakeSandbox()
+        await swe_task.prepare_workspace(
+            sb,
+            "/testbed",
+            {"problem_statement": "Fix the bug."},
+            write_problem_statement=write_problem_statement,
+        )
+        return sb
+
+    sb = asyncio.run(run_case())
+    written = "/testbed/PROBLEM_STATEMENT.md" in sb.files
+    assert written is write_problem_statement
+    if written:
+        assert sb.files["/testbed/PROBLEM_STATEMENT.md"] == "Fix the bug."
+
+
+def test_prepare_workspace_writes_problem_statement_by_default():
+    """Callers that predate the flag keep the old behaviour."""
+
+    async def run_case():
+        sb = FakeSandbox()
+        await swe_task.prepare_workspace(sb, "/testbed", {"problem_statement": "Fix the bug."})
+        return sb
+
+    assert "/testbed/PROBLEM_STATEMENT.md" in asyncio.run(run_case()).files
 
 
 def test_evaluate_can_reuse_agent_sandbox(monkeypatch):

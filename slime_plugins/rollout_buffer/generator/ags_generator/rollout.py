@@ -51,7 +51,7 @@ class AGSRolloutRunner:
         )
         self._boot_sem = asyncio.Semaphore(self.config.boot_concurrency)
 
-    async def generate(self, base_sample: Sample, sampling_params: dict) -> list[Sample]:
+    async def generate(self, base_sample: Sample, sampling_params: dict, *, evaluation: bool = False) -> list[Sample]:
         md = get_metadata(base_sample)
         instance_id = md["instance_id"]
         base_sample = copy.deepcopy(base_sample)
@@ -92,14 +92,20 @@ class AGSRolloutRunner:
             session_opened = True
             async with asyncio.timeout(self.config.rollout_guard_sec):
                 async with self._boot_agent_sandbox(md["image"], instance_id) as sb:
-                    await prepare_workspace(sb, md["workdir"], md)
+                    prompt_style = self.config.prompt_style_for(evaluation=evaluation)
+                    await prepare_workspace(
+                        sb,
+                        md["workdir"],
+                        md,
+                        write_problem_statement=prompt_style == "instruction",
+                    )
                     agent_exit_code = await self.harness_cls().run(
                         sb,
                         workdir=md["workdir"],
                         session_id=session_id,
                         adapter_url=self.adapter_service.adapter_url,
                         time_budget_sec=self.config.agent_time_budget_sec,
-                        prompt=self.config.prompt,
+                        prompt=self._agent_prompt(md, prompt_style),
                     )
                     trajectory_path = await self.artifacts.dump_trajectory(sb, md["workdir"], artifact_id)
                     diff_text = await git_diff(sb, md["workdir"])
@@ -231,6 +237,35 @@ class AGSRolloutRunner:
                         session_id,
                         traceback.format_exc(),
                     )
+
+    def _agent_prompt(self, md: dict, prompt_style: str) -> str:
+        """Build the prompt handed to the coding agent.
+
+        "dataset" forwards the row's own prompt untouched, which for converted
+        Harbor data is instruction.md byte for byte -- the same string Harbor hands
+        its agents. "instruction" instead sends SWE_CC_PROMPT, which tells the
+        agent to go read PROBLEM_STATEMENT.md and costs it turns before it even
+        knows the task. The caller picks the style per rollout (training vs eval);
+        see AGSGeneratorConfig.prompt_style_for.
+
+        An empty prompt field falls back to SWE_CC_PROMPT rather than sending the
+        agent nothing, but prepare_workspace only writes PROBLEM_STATEMENT.md for
+        the "instruction" style -- so under this fallback the file the prompt
+        names is absent. It should not happen (the converter always writes a
+        prompt), hence the warning.
+        """
+        if prompt_style == "instruction":
+            return self.config.prompt
+
+        text = (md.get("dataset_prompt") or "").strip()
+        if not text:
+            logger.warning(
+                "[ags_generator] %s: prompt_style=dataset but the row's prompt is empty; "
+                "falling back to SWE_CC_PROMPT, whose PROBLEM_STATEMENT.md was not written",
+                md.get("instance_id"),
+            )
+            return self.config.prompt
+        return text
 
     def _check_empty_patch(
         self,

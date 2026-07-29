@@ -109,6 +109,17 @@ export SWE_BOOT_CONCURRENCY="${SWE_BOOT_CONCURRENCY:-32}"
 export SWE_BOOT_RETRIES="${SWE_BOOT_RETRIES:-10}"
 export SWE_ROLLOUT_CONCURRENCY="${SWE_ROLLOUT_CONCURRENCY:-32}"
 
+# How the agent receives the task, set separately for training and periodic eval.
+#   instruction: send SWE_CC_PROMPT and write PROBLEM_STATEMENT.md; the agent
+#                spends its first turns finding and reading that file.
+#   dataset:     hand the row's prompt over directly and write no file.
+# Eval uses dataset so the score reflects the model working the task itself,
+# the way Harbor measures it, rather than its file-discovery turns. For converted
+# Harbor prompt data both paths carry the same instruction.md text, so this
+# changes when the agent sees the task, not what it reads.
+export SWE_PROMPT_STYLE="${SWE_PROMPT_STYLE:-instruction}"
+export SWE_EVAL_PROMPT_STYLE="${SWE_EVAL_PROMPT_STYLE:-dataset}"
+
 # # autoCompactWindow (80k) < MAX_CONTEXT_LEN (96k) so the CLI compacts before any
 # # segment crosses the training-side cap. `investigator` is a read-only sub-agent.
 # SETTINGS_JSON='{"permissions":{"defaultMode":"bypassPermissions"},"autoCompactEnabled":true,"autoCompactWindow":80000}'
@@ -319,7 +330,7 @@ keys = (
     "SWE_AGENT_TIME_BUDGET_SEC", "SWE_EVAL_TIMEOUT_SEC", "SWE_EVAL_ISOLATED_SANDBOX",
     "SWE_BOOT_CONCURRENCY",
     "SWE_BOOT_RETRIES", "SWE_ROLLOUT_GUARD_SEC", "SWE_ROLLOUT_CONCURRENCY",
-    "SWE_EMPTY_PATCH_GUARD",
+    "SWE_EMPTY_PATCH_GUARD", "SWE_PROMPT_STYLE", "SWE_EVAL_PROMPT_STYLE",
     "SLIME_AGENT_CC_MAX_TURNS", "SLIME_AGENT_CC_EXTRA_ARGS", "SLIME_AGENT_CC_EXTRA_ENVS",
     "CLAUDE_CODE_MAX_OUTPUT_TOKENS", "SWE_CC_PROMPT",
 )

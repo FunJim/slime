@@ -11,6 +11,10 @@ set of fields that slime's AGS rollout-buffer generator already consumes:
   - metadata.problem_statement
   - metadata.eval_cmd
 
+Both the prompt and metadata.problem_statement are Harbor's instruction.md, the
+exact string Harbor hands its agents.  Upstream's raw tests/config.json text is
+kept under metadata.harbor.problem_statement for provenance.
+
 The generated rows are still ordinary slime JSONL prompt data: use --input-key
 prompt, --label-key label, and --metadata-key metadata.  The eval command is
 built from Harbor's tests/test.sh plus tests/config.json so the row can be used
@@ -115,12 +119,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--label-key", default="label", help="Label key to write. Use '' to disable.")
     parser.add_argument("--metadata-key", default="metadata", help="Metadata key to write.")
     parser.add_argument(
-        "--prompt-source",
-        choices=("problem_statement", "instruction"),
-        default="problem_statement",
-        help="Which extracted text to put in the primary prompt field.",
-    )
-    parser.add_argument(
         "--default-workdir",
         default="/testbed",
         help="Workdir fallback when environment/Dockerfile has no WORKDIR.",
@@ -223,7 +221,6 @@ def task_to_row(
     prompt_alias_key: str,
     label_key: str,
     metadata_key: str,
-    prompt_source: str,
     image_override: str | None,
     default_workdir: str,
     include_eval_cmd: bool,
@@ -239,8 +236,14 @@ def task_to_row(
 
     instance_id = str(swe_config.get("instance_id") or task_dir.name)
     source_name = source or dataset_root.name
-    problem_statement = str(swe_config.get("problem_statement") or instruction)
-    prompt = problem_statement if prompt_source == "problem_statement" else instruction
+    # Both the prompt and metadata.problem_statement are Harbor's instruction.md:
+    # that is the exact string Harbor hands its agents, and having the two agree
+    # means a consumer reading either one gets the same text. The raw
+    # tests/config.json field is preserved under metadata.harbor.problem_statement
+    # -- it is upstream's own text, still carrying CRLF on about half of SWE-bench
+    # Verified, whereas instruction.md is dedent-normalised and wrapped in a
+    # "# Task" header plus a Repo/Version/Base commit/Instance ID block.
+    prompt = instruction
     image = image_override or extract_dockerfile_image(dockerfile)
     if not image:
         raise ValueError(f"Cannot extract Docker image from {task_dir / 'environment' / 'Dockerfile'}")
@@ -256,7 +259,7 @@ def task_to_row(
         "source": source_name,
         "image": image,
         "workdir": workdir,
-        "problem_statement": problem_statement,
+        "problem_statement": instruction,
         "harbor": harbor_metadata(task_dir, source_name, task_toml, swe_config, image, workdir),
     }
     if include_eval_cmd:
@@ -331,6 +334,9 @@ def harbor_metadata(
         {
             "task_name": task_dir.name,
             "source": source_name,
+            # Upstream's raw text, as opposed to the top-level problem_statement,
+            # which is Harbor's rendered instruction.md (see task_to_row).
+            "problem_statement": swe_config.get("problem_statement"),
             "repo": swe_config.get("repo"),
             "version": swe_config.get("version"),
             "base_commit": swe_config.get("base_commit"),
@@ -441,7 +447,10 @@ def write_pretty_example(rows: list[dict[str, Any]], output: Path) -> None:
 def write_schema(output: Path, *, input_key: str, prompt_alias_key: str, label_key: str, metadata_key: str) -> None:
     row_required = [input_key, metadata_key]
     properties: dict[str, Any] = {
-        input_key: {"type": "string", "description": "Primary slime prompt key."},
+        input_key: {
+            "type": "string",
+            "description": "Primary slime prompt key; Harbor's instruction.md verbatim.",
+        },
         metadata_key: {
             "type": "object",
             "required": ["instance_id", "image", "workdir", "problem_statement"],
@@ -450,7 +459,13 @@ def write_schema(output: Path, *, input_key: str, prompt_alias_key: str, label_k
                 "source": {"type": "string"},
                 "image": {"type": "string", "description": "Sandbox image consumed by ags_generator."},
                 "workdir": {"type": "string", "description": "Repository path inside the sandbox."},
-                "problem_statement": {"type": "string"},
+                "problem_statement": {
+                    "type": "string",
+                    "description": (
+                        "Harbor's instruction.md, same as the prompt. Upstream's raw "
+                        "tests/config.json text is under harbor.problem_statement."
+                    ),
+                },
                 "eval_cmd": {
                     "type": "string",
                     "description": (
@@ -497,7 +512,6 @@ def convert_tasks(
     prompt_alias_key: str,
     label_key: str,
     metadata_key: str,
-    prompt_source: str,
     image_override: str | None,
     default_workdir: str,
     include_eval_cmd: bool,
@@ -520,7 +534,6 @@ def convert_tasks(
                 prompt_alias_key=prompt_alias_key,
                 label_key=label_key,
                 metadata_key=metadata_key,
-                prompt_source=prompt_source,
                 image_override=image_override,
                 default_workdir=default_workdir,
                 include_eval_cmd=include_eval_cmd,
@@ -544,7 +557,6 @@ def convert_tasks(
                 prompt_alias_key=prompt_alias_key,
                 label_key=label_key,
                 metadata_key=metadata_key,
-                prompt_source=prompt_source,
                 image_override=image_override,
                 default_workdir=default_workdir,
                 include_eval_cmd=include_eval_cmd,
@@ -638,7 +650,6 @@ def main() -> None:
         prompt_alias_key=args.prompt_alias_key,
         label_key=args.label_key,
         metadata_key=args.metadata_key,
-        prompt_source=args.prompt_source,
         image_override=args.image,
         default_workdir=args.default_workdir,
         include_eval_cmd=not args.no_eval_cmd,

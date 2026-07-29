@@ -64,7 +64,6 @@ def test_converter_preserves_image_head_by_default(converter_module, harbor_task
         prompt_alias_key="",
         label_key="label",
         metadata_key="metadata",
-        prompt_source="problem_statement",
         image_override=None,
         default_workdir="/testbed",
         include_eval_cmd=True,
@@ -76,6 +75,49 @@ def test_converter_preserves_image_head_by_default(converter_module, harbor_task
     metadata = row["metadata"]
     assert "pre_commands" not in metadata
     assert _embedded_test_script(metadata["eval_cmd"]) == (harbor_task / "tests" / "test.sh").read_text()
+
+
+def test_prompt_source_option_is_removed(converter_module, monkeypatch: pytest.MonkeyPatch):
+    """--prompt-source no longer exists; instruction.md is now unconditional.
+
+    The flag's only other value fed the raw tests/config.json text to the agent,
+    which keeps upstream CRLF on ~50% of SWE-bench Verified and drops Harbor's
+    header and provenance block. Accepting the flag silently would let an old
+    command line look like it still selected that behaviour.
+    """
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["x", "--input", ".", "--output", "out.jsonl", "--prompt-source", "problem_statement"],
+    )
+    with pytest.raises(SystemExit):
+        converter_module.parse_args()
+
+
+def test_prompt_and_problem_statement_are_harbor_instruction(converter_module, harbor_task: Path):
+    """Prompt and metadata.problem_statement are both instruction.md; the raw
+    tests/config.json text survives under metadata.harbor.problem_statement."""
+    instruction = "# Task\n\nFix the bug.\n\n---\n\n**Repo:** example/sample\n"
+    (harbor_task / "instruction.md").write_text(instruction)
+    row = converter_module.task_to_row(
+        harbor_task,
+        dataset_root=harbor_task.parent,
+        source="test",
+        input_key="prompt",
+        prompt_alias_key="",
+        label_key="label",
+        metadata_key="metadata",
+        image_override=None,
+        default_workdir="/testbed",
+        include_eval_cmd=True,
+        include_inline_files=False,
+        inline_files=(),
+        provenance_root=False,
+    )
+    assert row["prompt"] == instruction
+    assert row["metadata"]["problem_statement"] == instruction
+    # the raw upstream field differs from instruction.md and must not be lost
+    assert row["metadata"]["harbor"]["problem_statement"] == "Fix the bug."
 
 
 def test_reset_to_base_commit_option_is_removed(converter_module, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):

@@ -19,6 +19,23 @@ from dataclasses import dataclass
 # never retried.
 EMPTY_PATCH_GUARD_POLICIES = frozenset({"off", "metrics", "abort"})
 
+# How the agent learns what to do.
+#   "instruction" -- send SWE_CC_PROMPT, which points at PROBLEM_STATEMENT.md
+#   "dataset"     -- send the row's own prompt field verbatim
+#
+# Set independently for training (SWE_PROMPT_STYLE) and periodic eval
+# (SWE_EVAL_PROMPT_STYLE), because the two want different things: eval should
+# measure the model the way a benchmark would, handing over the task text
+# directly the way Harbor does, while training may prefer the agent to work for
+# it. Converted Harbor rows carry the same instruction.md text in both the prompt
+# field and metadata.problem_statement, so the styles differ in *when* the agent
+# sees the task, not in what it reads.
+#
+# Only "instruction" writes PROBLEM_STATEMENT.md into the workspace (see
+# swe_task.prepare_workspace) -- under "dataset" the prompt already carries the
+# task text, so the file would just be a stray artifact in the repo.
+PROMPT_STYLES = frozenset({"dataset", "instruction"})
+
 
 @dataclass(frozen=True)
 class AGSGeneratorConfig:
@@ -39,6 +56,8 @@ class AGSGeneratorConfig:
     enable_token2text: bool
     prompt: str
     empty_patch_guard: str
+    prompt_style: str
+    eval_prompt_style: str
 
     @classmethod
     def from_env(cls, *, enable_token2text: bool = False) -> AGSGeneratorConfig:
@@ -68,7 +87,13 @@ class AGSGeneratorConfig:
                 "Read PROBLEM_STATEMENT.md in the current directory and resolve the issue. Edit source files only (do NOT touch tests). After editing, run the relevant tests to verify your fix passes. Do NOT modify PROBLEM_STATEMENT.md and do NOT commit. When finished, print a one-line summary and exit.",
             ),
             empty_patch_guard=_empty_patch_guard_policy(os.environ.get("SWE_EMPTY_PATCH_GUARD")),
+            prompt_style=_prompt_style("SWE_PROMPT_STYLE", default="instruction"),
+            eval_prompt_style=_prompt_style("SWE_EVAL_PROMPT_STYLE", default="dataset"),
         )
+
+    def prompt_style_for(self, *, evaluation: bool) -> str:
+        """Prompt style for this rollout: eval and training are set separately."""
+        return self.eval_prompt_style if evaluation else self.prompt_style
 
 
 def _empty_patch_guard_policy(raw: str | None) -> str:
@@ -81,6 +106,15 @@ def _empty_patch_guard_policy(raw: str | None) -> str:
     if policy not in EMPTY_PATCH_GUARD_POLICIES:
         raise ValueError(f"SWE_EMPTY_PATCH_GUARD={raw!r} is not one of {sorted(EMPTY_PATCH_GUARD_POLICIES)}")
     return policy
+
+
+def _prompt_style(env_name: str, *, default: str) -> str:
+    """Validate a prompt-style env var, naming it in the error."""
+    raw = os.environ.get(env_name)
+    style = (raw or default).strip().lower()
+    if style not in PROMPT_STYLES:
+        raise ValueError(f"{env_name}={raw!r} is not one of {sorted(PROMPT_STYLES)}")
+    return style
 
 
 def _env_flag(name: str, *, default: bool) -> bool:
