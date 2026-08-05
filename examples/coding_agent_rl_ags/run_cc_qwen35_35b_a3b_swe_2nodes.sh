@@ -120,27 +120,88 @@ export SWE_ROLLOUT_CONCURRENCY="${SWE_ROLLOUT_CONCURRENCY:-32}"
 export SWE_PROMPT_STYLE="${SWE_PROMPT_STYLE:-instruction}"
 export SWE_EVAL_PROMPT_STYLE="${SWE_EVAL_PROMPT_STYLE:-dataset}"
 
-# # autoCompactWindow (80k) < MAX_CONTEXT_LEN (96k) so the CLI compacts before any
-# # segment crosses the training-side cap. `investigator` is a read-only sub-agent.
-# SETTINGS_JSON='{"permissions":{"defaultMode":"bypassPermissions"},"autoCompactEnabled":true,"autoCompactWindow":80000}'
+# ---- auto-compaction -------------------------------------------------------
+# Compact before a segment crosses the training-side context cap, otherwise the
+# adapter returns finish_reason="length" with zero output tokens once the prompt
+# reaches rollout_max_context_len (slime/agent/adapters/common.py) and the turn is
+# wasted.
+#
+# Expressed as a PERCENTAGE of the model's context window rather than an absolute
+# token count: an absolute auto-compact window is clamped to [100k, 1M] by both
+# CLIs, which is above our 96k cap, so it could never fire in time. Both CLIs are
+# also told the real window, so the percentage is of MAX_CONTEXT_LEN on each side.
+#
+#   CodeBuddy   CODEBUDDY_AUTOCOMPACT_PCT_OVERRIDE (cbc 1.9.33) is a percentage of
+#               the model's maxInputTokens, which the harness writes into
+#               models.json from SLIME_AGENT_MAX_INPUT_TOKENS. Without that key
+#               resolveCompactTriggerAt() falls back to the clamped absolute
+#               window. Source: agent-cli src/node/context/context-protocol.ts.
+#   Claude Code CLAUDE_AUTOCOMPACT_PCT_OVERRIDE, as a percentage of the context
+#               window, which CLAUDE_CODE_MAX_CONTEXT_TOKENS sets. That variable
+#               applies DIRECTLY for model names claude does not recognise as a
+#               Claude model -- ours is "slime-actor", so it does (the binary
+#               gates on `!normalize(model).startsWith("claude-")`; for a real
+#               claude-* name it would need DISABLE_COMPACT too, which would
+#               disable the compaction we want). Without it the CLI assumes its
+#               200000 default and would compact at pct% of 200k, i.e. never
+#               before our 96k cap.
+# 60%, not the CLI's 70% default, because the per-turn output reservation eats
+# into what is reachable: claude assumes MAX_OUTPUT_TOKENS (32000 by default for
+# model ids it does not recognise, which includes ours) is available on top of the
+# prompt, so the prompt cannot grow past MAX_CONTEXT_LEN - MAX_GEN_LEN ~= 63k
+# before the adapter's hard stop. A 70% trigger (67200) sits ABOVE that and would
+# never be reached; 60% (57600) fires with room to spare. Raising
+# AGENT_AUTOCOMPACT_PCT re-opens that gap -- the check below says so out loud.
+AGENT_AUTOCOMPACT_PCT="${AGENT_AUTOCOMPACT_PCT:-60}"
+AGENT_MAX_CONTEXT_TOKENS="${AGENT_MAX_CONTEXT_TOKENS:-${MAX_CONTEXT_LEN}}"
+
+# cbc: models.json maxInputTokens (written by CodeBuddyCodeHarness).
+export SLIME_AGENT_MAX_INPUT_TOKENS="${SLIME_AGENT_MAX_INPUT_TOKENS:-${AGENT_MAX_CONTEXT_TOKENS}}"
+# Built in a separate variable, not inline in ${VAR:-...}: a JSON default inside
+# that expansion is mis-parsed -- the value's own "}" closes the expansion early
+# and the trailing brace leaks into the result ("{...}}").
+CBC_AUTOCOMPACT_ENVS="{\"CODEBUDDY_AUTOCOMPACT_PCT_OVERRIDE\":\"${AGENT_AUTOCOMPACT_PCT}\"}"
+export SLIME_AGENT_CBC_EXTRA_ENVS="${SLIME_AGENT_CBC_EXTRA_ENVS:-${CBC_AUTOCOMPACT_ENVS}}"
+
+# claude: declare the window and the per-turn output budget, then set the trigger
+# percentage. MAX_OUTPUT_TOKENS is pinned to MAX_GEN_LEN rather than left at the
+# CLI's 32000 default-for-unknown-model-ids so the reservation matches what the
+# adapter will actually serve (--rollout-max-response-len).
+CC_AUTOCOMPACT_ENVS="{\"CLAUDE_CODE_MAX_CONTEXT_TOKENS\":\"${AGENT_MAX_CONTEXT_TOKENS}\",\"CLAUDE_CODE_MAX_OUTPUT_TOKENS\":\"${MAX_GEN_LEN}\",\"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE\":\"${AGENT_AUTOCOMPACT_PCT}\"}"
+export SLIME_AGENT_CC_EXTRA_ENVS="${SLIME_AGENT_CC_EXTRA_ENVS:-${CC_AUTOCOMPACT_ENVS}}"
+
+AGENT_AUTOCOMPACT_AT=$((AGENT_AUTOCOMPACT_PCT * AGENT_MAX_CONTEXT_TOKENS / 100))
+# The largest prompt that can still be served: the adapter caps prompt+output at
+# rollout_max_context_len, so a turn needs MAX_GEN_LEN of headroom.
+AGENT_PROMPT_CEILING=$((MAX_CONTEXT_LEN - MAX_GEN_LEN))
+echo "Auto-compact:  ${AGENT_AUTOCOMPACT_PCT}% of ${AGENT_MAX_CONTEXT_TOKENS} = ${AGENT_AUTOCOMPACT_AT} tokens" \
+     "(prompt ceiling ${AGENT_PROMPT_CEILING} = ${MAX_CONTEXT_LEN} - ${MAX_GEN_LEN})"
+if (( AGENT_AUTOCOMPACT_AT >= AGENT_PROMPT_CEILING )); then
+  echo "WARNING: the compaction trigger (${AGENT_AUTOCOMPACT_AT}) is at or above the prompt ceiling" \
+       "(${AGENT_PROMPT_CEILING}); turns will hit finish_reason=length before compaction fires." \
+       "Lower AGENT_AUTOCOMPACT_PCT to <= $((AGENT_PROMPT_CEILING * 100 / AGENT_MAX_CONTEXT_TOKENS))."
+fi
+if (( AGENT_MAX_CONTEXT_TOKENS > MAX_CONTEXT_LEN )); then
+  echo "WARNING: declared context ${AGENT_MAX_CONTEXT_TOKENS} > MAX_CONTEXT_LEN ${MAX_CONTEXT_LEN};" \
+       "the adapter hard-stops at the latter."
+fi
+
+# # `investigator` is a read-only sub-agent, dispatched via the Agent tool.
 # AGENTS_JSON='{"investigator":{"description":"Searches the repo for relevant files before any edit","prompt":"You are an investigator sub-agent. Use Grep/Read/Glob to find every file relevant to the user task, then return a short bulleted summary. Do NOT edit anything.","tools":["Grep","Read","Glob"]}}'
-# export SLIME_AGENT_CC_EXTRA_ARGS="--settings '${SETTINGS_JSON}' --disable-slash-commands --agents '${AGENTS_JSON}'"
+# export SLIME_AGENT_CC_EXTRA_ARGS="${SLIME_AGENT_CC_EXTRA_ARGS} --disable-slash-commands --agents '${AGENTS_JSON}'"
 # (WebFetch/WebSearch are already denied by the harness default; EXTRA_ARGS is
 #  appended last, so anything set here overrides a repeated default flag.)
-# The only two harness knobs: extra CLI flags, and extra env vars as JSON.
-# Everything else (denied tools, the launch flags) is a class attribute in
+# The only two harness knobs per agent: extra CLI flags, and extra env vars as
+# JSON. Everything else (denied tools, the launch flags) is a class attribute in
 # slime_plugins/.../harnesses.py, because it is a property of the harness rather
 # than of a run. Both are applied LAST -- EXTRA_ARGS after the harness's own
 # flags (claude takes the last occurrence of a repeated flag, verified against
 # the real CLI) and EXTRA_ENVS after static_env -- so either can override a
-# harness default.
+# harness default. The *_EXTRA_ENVS pair is set in the auto-compaction block
+# above; these two are the remaining passthroughs, declared so SWE_AGENT can be
+# either harness from this script (run_cbc_*.sh just sets it and re-execs).
 export SLIME_AGENT_CC_EXTRA_ARGS="${SLIME_AGENT_CC_EXTRA_ARGS:-}"
-export SLIME_AGENT_CC_EXTRA_ENVS="${SLIME_AGENT_CC_EXTRA_ENVS:-}"
-
-# The CodeBuddy equivalents, so SWE_AGENT=codebuddy_code works from this script
-# too (run_cbc_*.sh just sets SWE_AGENT and re-execs this one).
 export SLIME_AGENT_CBC_EXTRA_ARGS="${SLIME_AGENT_CBC_EXTRA_ARGS:-}"
-export SLIME_AGENT_CBC_EXTRA_ENVS="${SLIME_AGENT_CBC_EXTRA_ENVS:-}"
 
 # Optional: require dispatching the investigator before any edit, to maximize sub-agent fan-out.
 # export SWE_CC_PROMPT="Read PROBLEM_STATEMENT.md. BEFORE editing any file, dispatch the 'investigator' sub-agent (via the Agent tool with subagent_type=investigator) to locate every file relevant to the issue. Then fix the issue and run the tests."
@@ -347,6 +408,9 @@ keys = (
     "SWE_EMPTY_PATCH_GUARD", "SWE_PROMPT_STYLE", "SWE_EVAL_PROMPT_STYLE",
     "SLIME_AGENT_CC_EXTRA_ARGS", "SLIME_AGENT_CC_EXTRA_ENVS",
     "SLIME_AGENT_CBC_EXTRA_ARGS", "SLIME_AGENT_CBC_EXTRA_ENVS",
+    # Read by CodeBuddyCodeHarness.write_config to set models.json maxInputTokens,
+    # which is what the auto-compact percentage is a percentage OF.
+    "SLIME_AGENT_MAX_INPUT_TOKENS",
     "SWE_CC_PROMPT",
 )
 env = {k: os.environ[k] for k in keys if k in os.environ}

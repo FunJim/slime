@@ -106,6 +106,10 @@ class CodeBuddyCodeHarness(BaseHarness):
     name = "codebuddy_code"
     extra_args_env = "SLIME_AGENT_CBC_EXTRA_ARGS"
     extra_envs_env = "SLIME_AGENT_CBC_EXTRA_ENVS"
+    # The serving-side context cap, mirrored into models.json as maxInputTokens so
+    # auto-compaction can be expressed as a percentage of it.  Read from the env
+    # rather than passed in because HarnessContext carries no run config.
+    max_input_tokens_env = "SLIME_AGENT_MAX_INPUT_TOKENS"
 
     # Baseline flags, emitted BEFORE extra_args so a caller can override any of
     # them: commander's last-flag-wins was verified against cbc 2.125.0
@@ -143,19 +147,31 @@ class CodeBuddyCodeHarness(BaseHarness):
         )
 
     async def write_config(self, sb: Sandbox, ctx: HarnessContext) -> None:
+        model_entry = {
+            "id": ctx.model_label,
+            "name": ctx.model_label,
+            "vendor": "OpenAI",
+            "apiKey": ctx.session_id,
+            "url": self._chat_completions_url(ctx.adapter_url),
+            "supportsToolCall": True,
+            "supportsImages": False,
+            "supportsReasoning": True,
+        }
+        # maxInputTokens is what makes percentage-based auto-compaction usable.
+        # resolveCompactTriggerAt (agent-cli src/node/context/context-protocol.ts):
+        #     modelMaxInputTokens ? modelMaxInputTokens * percentThreshold
+        #                         : getAutoCompactWindow()
+        # Without it the CLI falls back to CODEBUDDY_AUTO_COMPACT_WINDOW, which is
+        # clamped to [100k, 1M] -- above our 96k context cap, so compaction could
+        # never fire in time. With it, CODEBUDDY_AUTOCOMPACT_PCT_OVERRIDE becomes a
+        # percentage OF THIS VALUE and there is no clamp. The launcher passes the
+        # run's rollout_max_context_len here.
+        max_input_tokens = _positive_int_env(self.max_input_tokens_env)
+        if max_input_tokens:
+            model_entry["maxInputTokens"] = max_input_tokens
+
         models_json = {
-            "models": [
-                {
-                    "id": ctx.model_label,
-                    "name": ctx.model_label,
-                    "vendor": "OpenAI",
-                    "apiKey": ctx.session_id,
-                    "url": self._chat_completions_url(ctx.adapter_url),
-                    "supportsToolCall": True,
-                    "supportsImages": False,
-                    "supportsReasoning": True,
-                }
-            ],
+            "models": [model_entry],
             "availableModels": [ctx.model_label],
         }
         settings_json = {
@@ -255,6 +271,18 @@ class CodeBuddyCodeHarness(BaseHarness):
         if url.endswith("/v1"):
             return f"{url}/chat/completions"
         return f"{url}/v1/chat/completions"
+
+
+def _positive_int_env(name: str) -> int | None:
+    """Read a positive int from the environment, ignoring unset/blank/invalid."""
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
 
 
 def _json_b64(value: dict) -> str:

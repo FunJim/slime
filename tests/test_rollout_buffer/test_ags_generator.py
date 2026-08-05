@@ -1082,3 +1082,66 @@ def test_ags_timeout_fails_closed_if_agent_process_group_cannot_be_stopped():
             )
 
     asyncio.run(run_case())
+
+
+def test_autocompact_percentage_reaches_each_cli(monkeypatch):
+    """Auto-compaction is configured as a PERCENTAGE, not an absolute window.
+
+    Both CLIs clamp an absolute auto-compact window to [100k, 1M], which is above
+    the default 96k context cap -- so an absolute setting could never fire in time.
+    The percentage path has no clamp.
+
+    For CodeBuddy the percentage is of the model's maxInputTokens, so models.json
+    MUST carry that key: resolveCompactTriggerAt() in agent-cli
+    src/node/context/context-protocol.ts reads
+    `modelMaxInputTokens ? modelMaxInputTokens * pct : getAutoCompactWindow()`,
+    and the fallback is the clamped absolute window.
+    """
+
+    async def run_case():
+        monkeypatch.setenv("SLIME_AGENT_MAX_INPUT_TOKENS", "96000")
+        sb = FakeSandbox()
+        await CodeBuddyCodeHarness().write_config(sb, _ctx(sid="s", url="http://host:18001"))
+        cmd = next(c for c, _ in sb.exec_log if "/root/.codebuddy/models.json" in c)
+        models = _decode_first_b64(cmd, "/root/.codebuddy/models.json")
+        assert models["models"][0]["maxInputTokens"] == 96000
+        # The on/off switch lives in settings.json, the threshold in the env var.
+        assert _decode_first_b64(cmd, "/root/.codebuddy/settings.json")["autoCompactEnabled"] is True
+
+        # Absent/blank/garbage must leave the key out rather than write a bogus
+        # value, since a wrong maxInputTokens silently moves the trigger point.
+        for bad in ("", "0", "-1", "not-a-number"):
+            monkeypatch.setenv("SLIME_AGENT_MAX_INPUT_TOKENS", bad)
+            sb_bad = FakeSandbox()
+            await CodeBuddyCodeHarness().write_config(sb_bad, _ctx(sid="s", url="http://host:18001"))
+            cmd_bad = next(c for c, _ in sb_bad.exec_log if "/root/.codebuddy/models.json" in c)
+            entry = _decode_first_b64(cmd_bad, "/root/.codebuddy/models.json")["models"][0]
+            assert "maxInputTokens" not in entry, bad
+
+        # The thresholds themselves ride the two EXTRA_* knobs.
+        monkeypatch.setenv("SLIME_AGENT_CBC_EXTRA_ENVS", '{"CODEBUDDY_AUTOCOMPACT_PCT_OVERRIDE":"70"}')
+        sb2 = FakeSandbox()
+        await CodeBuddyCodeHarness().launch_and_wait(
+            sb2, _ctx(sid="s", url="http://host:18001"), prompt="go", time_budget_sec=0
+        )
+        assert "CODEBUDDY_AUTOCOMPACT_PCT_OVERRIDE=70" in next(c for c, _ in sb2.exec_log if "setsid" in c)
+
+        # Claude Code needs the window declared too, or the percentage is of its
+        # 200000 default -- which our 96k cap is never reached from. It applies
+        # directly because "slime-actor" is not a claude-* name.
+        monkeypatch.setenv(
+            "SLIME_AGENT_CC_EXTRA_ENVS",
+            '{"CLAUDE_CODE_MAX_CONTEXT_TOKENS":"96000",'
+            '"CLAUDE_CODE_MAX_OUTPUT_TOKENS":"32768",'
+            '"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE":"60"}',
+        )
+        sb3 = FakeSandbox()
+        await AGSSidecarClaudeCodeHarness().launch_and_wait(
+            sb3, _ctx(sid="s", url="http://host:18001"), prompt="go", time_budget_sec=0
+        )
+        launch = next(c for c, _ in sb3.exec_log if "setsid" in c)
+        assert "CLAUDE_CODE_MAX_CONTEXT_TOKENS=96000" in launch
+        assert "CLAUDE_CODE_MAX_OUTPUT_TOKENS=32768" in launch
+        assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=60" in launch
+
+    asyncio.run(run_case())
