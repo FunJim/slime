@@ -62,7 +62,7 @@ HF_CHECKPOINT="${HF_CHECKPOINT:-/data_train/ericxjzheng/models/Qwen3.5-35B-A3B}"
 REF_MODEL_PATH="${REF_MODEL_PATH:-/data_train/ericxjzheng/models/Qwen3.5-35B-A3B_torch_dist}"
 PROMPT_DATA="${PROMPT_DATA:-/data_train/ericxjzheng/data/SWE-rebench-filtered/filtered.jsonl}"
 
-EXP_TAG="${EXP_TAG:-claude_code_ags_qwen35_35b_a3b_4nodes}"
+EXP_TAG="${EXP_TAG:-coding_agent_rl_ags_cc_qwen35_35b_a3b_4nodes}"
 STAMP="$(date +%Y%m%d_%H%M%S)"
 RUN_ROOT="${RUN_ROOT:-${EXP}/runs/${EXP_TAG}_${STAMP}}"
 
@@ -124,9 +124,23 @@ export SWE_EVAL_PROMPT_STYLE="${SWE_EVAL_PROMPT_STYLE:-dataset}"
 # # segment crosses the training-side cap. `investigator` is a read-only sub-agent.
 # SETTINGS_JSON='{"permissions":{"defaultMode":"bypassPermissions"},"autoCompactEnabled":true,"autoCompactWindow":80000}'
 # AGENTS_JSON='{"investigator":{"description":"Searches the repo for relevant files before any edit","prompt":"You are an investigator sub-agent. Use Grep/Read/Glob to find every file relevant to the user task, then return a short bulleted summary. Do NOT edit anything.","tools":["Grep","Read","Glob"]}}'
-# export SLIME_AGENT_CC_EXTRA_ARGS="--settings '${SETTINGS_JSON}' --disable-slash-commands --agents '${AGENTS_JSON}' --disallowedTools WebFetch WebSearch"
-export SLIME_AGENT_CC_MAX_TURNS="${SLIME_AGENT_CC_MAX_TURNS:-100}"
-export SLIME_AGENT_CC_EXTRA_ARGS="${SLIME_AGENT_CC_EXTRA_ARGS:---max-turns ${SLIME_AGENT_CC_MAX_TURNS}}"
+# export SLIME_AGENT_CC_EXTRA_ARGS="--settings '${SETTINGS_JSON}' --disable-slash-commands --agents '${AGENTS_JSON}'"
+# (WebFetch/WebSearch are already denied by the harness default; EXTRA_ARGS is
+#  appended last, so anything set here overrides a repeated default flag.)
+# The only two harness knobs: extra CLI flags, and extra env vars as JSON.
+# Everything else (denied tools, the launch flags) is a class attribute in
+# slime_plugins/.../harnesses.py, because it is a property of the harness rather
+# than of a run. Both are applied LAST -- EXTRA_ARGS after the harness's own
+# flags (claude takes the last occurrence of a repeated flag, verified against
+# the real CLI) and EXTRA_ENVS after static_env -- so either can override a
+# harness default.
+export SLIME_AGENT_CC_EXTRA_ARGS="${SLIME_AGENT_CC_EXTRA_ARGS:-}"
+export SLIME_AGENT_CC_EXTRA_ENVS="${SLIME_AGENT_CC_EXTRA_ENVS:-}"
+
+# The CodeBuddy equivalents, so SWE_AGENT=codebuddy_code works from this script
+# too (run_cbc_*.sh just sets SWE_AGENT and re-execs this one).
+export SLIME_AGENT_CBC_EXTRA_ARGS="${SLIME_AGENT_CBC_EXTRA_ARGS:-}"
+export SLIME_AGENT_CBC_EXTRA_ENVS="${SLIME_AGENT_CBC_EXTRA_ENVS:-}"
 
 # Optional: require dispatching the investigator before any edit, to maximize sub-agent fan-out.
 # export SWE_CC_PROMPT="Read PROBLEM_STATEMENT.md. BEFORE editing any file, dispatch the 'investigator' sub-agent (via the Agent tool with subagent_type=investigator) to locate every file relevant to the issue. Then fix the issue and run the tests."
@@ -331,8 +345,9 @@ keys = (
     "SWE_BOOT_CONCURRENCY",
     "SWE_BOOT_RETRIES", "SWE_ROLLOUT_GUARD_SEC", "SWE_ROLLOUT_CONCURRENCY",
     "SWE_EMPTY_PATCH_GUARD", "SWE_PROMPT_STYLE", "SWE_EVAL_PROMPT_STYLE",
-    "SLIME_AGENT_CC_MAX_TURNS", "SLIME_AGENT_CC_EXTRA_ARGS", "SLIME_AGENT_CC_EXTRA_ENVS",
-    "CLAUDE_CODE_MAX_OUTPUT_TOKENS", "SWE_CC_PROMPT",
+    "SLIME_AGENT_CC_EXTRA_ARGS", "SLIME_AGENT_CC_EXTRA_ENVS",
+    "SLIME_AGENT_CBC_EXTRA_ARGS", "SLIME_AGENT_CBC_EXTRA_ENVS",
+    "SWE_CC_PROMPT",
 )
 env = {k: os.environ[k] for k in keys if k in os.environ}
 env["MASTER_ADDR"] = os.environ["MASTER_ADDR"]

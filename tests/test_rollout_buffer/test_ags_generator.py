@@ -23,7 +23,11 @@ from slime_plugins.rollout_buffer.generator.ags_generator.entry import (
     is_valid_group,
     transform_group,
 )
-from slime_plugins.rollout_buffer.generator.ags_generator.harnesses import CodeBuddyCodeHarness, resolve_agent
+from slime_plugins.rollout_buffer.generator.ags_generator.harnesses import (
+    AGSSidecarClaudeCodeHarness,
+    CodeBuddyCodeHarness,
+    resolve_agent,
+)
 from slime_plugins.rollout_buffer.generator.ags_generator.rollout import AGSRolloutRunner
 from slime_plugins.rollout_buffer.generator.ags_generator.runner import run_root_command
 from slime_plugins.rollout_buffer.generator.ags_generator.sampling import normalize_sampling_params
@@ -921,10 +925,8 @@ def test_codebuddy_code_install_uses_ags_sidecar_binary():
     asyncio.run(run_case())
 
 
-def test_codebuddy_code_write_config_points_to_adapter(monkeypatch):
+def test_codebuddy_code_write_config_points_to_adapter():
     async def run_case():
-        monkeypatch.setenv("SLIME_AGENT_CBC_MAX_OUTPUT_TOKENS", "8192")
-        monkeypatch.setenv("SLIME_AGENT_CBC_THINKING_ENABLED", "false")
         sb = FakeSandbox()
         await CodeBuddyCodeHarness().write_config(sb, _ctx(sid="sess-cbc", url="http://host:18001"))
 
@@ -934,17 +936,17 @@ def test_codebuddy_code_write_config_points_to_adapter(monkeypatch):
         assert models["models"][0]["id"] == "slime-actor"
         assert models["models"][0]["apiKey"] == "sess-cbc"
         assert models["models"][0]["url"] == "http://host:18001/v1/chat/completions"
-        assert models["models"][0]["maxOutputTokens"] == 8192
         assert models["models"][0]["supportsToolCall"] is True
-        assert settings["alwaysThinkingEnabled"] is False
+        # No maxOutputTokens: the harness sets no per-turn cap, so the CLI applies
+        # its own default. The adapter still bounds a turn via max_new_tokens.
+        assert "maxOutputTokens" not in models["models"][0]
+        assert settings["alwaysThinkingEnabled"] is True
 
     asyncio.run(run_case())
 
 
-def test_codebuddy_code_launch_command_and_env(monkeypatch):
+def test_codebuddy_code_launch_command_and_env():
     async def run_case():
-        monkeypatch.setenv("SLIME_AGENT_CBC_MAX_TURNS", "7")
-        monkeypatch.setenv("SLIME_AGENT_CBC_THINKING_ENABLED", "false")
         sb = FakeSandbox()
         rc = await CodeBuddyCodeHarness().launch_and_wait(
             sb,
@@ -956,11 +958,19 @@ def test_codebuddy_code_launch_command_and_env(monkeypatch):
         assert rc != 0  # time_budget=0 avoids waiting; launch still happens.
         body = next(v for k, v in sb.files.items() if k.endswith("run.sh"))
         assert "cbc --model slime-actor --verbose --output-format stream-json --include-partial-messages" in body
-        assert "--max-turns 7" in body
         assert "-y" in body and "solve it" in body
-        assert "--effort none" in body
-        assert "--tools Bash,Read,Write,Edit,Glob,Grep,TaskCreate,TaskUpdate,TaskGet,TaskList,Agent" in body
+        # Tool restriction uses --disallowedTools, which the CLI enforces; --tools
+        # does not restrict the surface, so it is never passed.
+        assert "--disallowedTools WebSearch WebFetch" in body
+        assert "--tools" not in body
         assert "codebuddy_sessions" in body
+        # No turn cap from the harness: the run is bounded by
+        # SWE_AGENT_TIME_BUDGET_SEC, and a caller who wants one passes it in
+        # SLIME_AGENT_CBC_EXTRA_ARGS.
+        assert "--max-turns" not in body
+        # --disallowedTools is variadic, so the non-variadic tail and the prompt
+        # must follow it, or it would swallow them.
+        assert body.index("--disallowedTools") < body.index("-y") < body.index("solve it")
 
         launch_cmd = next(c for c, _ in sb.exec_log if "setsid" in c)
         assert "OPENAI_API_KEY=sess-cbc" in launch_cmd
@@ -970,6 +980,86 @@ def test_codebuddy_code_launch_command_and_env(monkeypatch):
         assert "IS_SANDBOX=1" in launch_cmd
         assert any("kill -TERM" in cmd for cmd, _user in sb.exec_log)
         assert any("kill -KILL" in cmd for cmd, _user in sb.exec_log)
+
+    asyncio.run(run_case())
+
+
+def test_extra_args_come_after_defaults_so_they_win(monkeypatch):
+    """EXTRA_ARGS is the only flag knob, so it must be able to beat a default.
+
+    Both CLIs take the LAST occurrence of a repeated flag (verified against the
+    real binaries: `--max-turns 99 --max-turns 1` stops after 1 turn on each), so
+    "wins" here means "appears later in the command".
+    """
+
+    async def run_case():
+        monkeypatch.setenv("SLIME_AGENT_CBC_EXTRA_ARGS", "--disallowedTools ImageGen --max-turns 7")
+        sb = FakeSandbox()
+        await CodeBuddyCodeHarness().launch_and_wait(
+            sb, _ctx(sid="s", url="http://host:18001"), prompt="go", time_budget_sec=0
+        )
+        body = next(v for k, v in sb.files.items() if k.endswith("run.sh"))
+        assert "--max-turns 7" in body
+        assert (
+            body.index("--disallowedTools WebSearch WebFetch")
+            < body.index("--disallowedTools ImageGen")
+            < body.index("go")
+        )
+
+        monkeypatch.setenv("SLIME_AGENT_CC_EXTRA_ARGS", "--disallowedTools ImageGen --max-turns 7")
+        sb2 = FakeSandbox()
+        await AGSSidecarClaudeCodeHarness().launch_and_wait(
+            sb2, _ctx(sid="s", url="http://host:18001"), prompt="go", time_budget_sec=0
+        )
+        body2 = next(v for k, v in sb2.files.items() if k.endswith("run.sh"))
+        assert "--max-turns 7" in body2
+        assert body2.index("--disallowedTools WebSearch WebFetch") < body2.index("--disallowedTools ImageGen")
+
+    asyncio.run(run_case())
+
+
+def test_web_tools_denied_by_default_on_both_harnesses():
+    """Web access makes a rollout unreproducible and can leak the graded fix.
+
+    A 2026-07-29 eval matrix had this denied for CodeBuddy but not for Claude
+    Code, which then used WebSearch/WebFetch on 1-2% of instances -- a difference
+    of the same order as the training effect being measured.
+    """
+
+    async def run_case():
+        for harness in (AGSSidecarClaudeCodeHarness(), CodeBuddyCodeHarness()):
+            sb = FakeSandbox()
+            await harness.launch_and_wait(sb, _ctx(sid="s", url="http://host:18001"), prompt="go", time_budget_sec=0)
+            body = next(v for k, v in sb.files.items() if k.endswith("run.sh"))
+            assert "--disallowedTools WebSearch WebFetch" in body, harness.name
+
+    asyncio.run(run_case())
+
+
+def test_claude_code_extra_envs_override_static_env(monkeypatch):
+    """EXTRA_ENVS is merged after static_env, so it can override any of it."""
+
+    async def run_case():
+        sb = FakeSandbox()
+        await AGSSidecarClaudeCodeHarness().launch_and_wait(
+            sb, _ctx(sid="s", url="http://host:18001"), prompt="go", time_budget_sec=0
+        )
+        launch_cmd = next(c for c, _ in sb.exec_log if "setsid" in c)
+        assert "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1" in launch_cmd
+        # The harness sets no per-turn output cap of its own.
+        assert "CLAUDE_CODE_MAX_OUTPUT_TOKENS" not in launch_cmd
+
+        monkeypatch.setenv(
+            "SLIME_AGENT_CC_EXTRA_ENVS",
+            '{"CLAUDE_CODE_MAX_OUTPUT_TOKENS":"4096","CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC":"0"}',
+        )
+        sb2 = FakeSandbox()
+        await AGSSidecarClaudeCodeHarness().launch_and_wait(
+            sb2, _ctx(sid="s", url="http://host:18001"), prompt="go", time_budget_sec=0
+        )
+        launch_cmd2 = next(c for c, _ in sb2.exec_log if "setsid" in c)
+        assert "CLAUDE_CODE_MAX_OUTPUT_TOKENS=4096" in launch_cmd2
+        assert "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=0" in launch_cmd2
 
     asyncio.run(run_case())
 

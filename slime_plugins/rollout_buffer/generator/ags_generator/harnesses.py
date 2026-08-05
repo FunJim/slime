@@ -22,6 +22,11 @@ class AGSSidecarClaudeCodeHarness(BaseHarness):
     extra_args_env = "SLIME_AGENT_CC_EXTRA_ARGS"
     extra_envs_env = "SLIME_AGENT_CC_EXTRA_ENVS"
     launch_flags = "--dangerously-skip-permissions --verbose --output-format stream-json --include-partial-messages --include-hook-events"
+
+    # Baseline flags, emitted BEFORE extra_args so a caller can override any of
+    # them (claude, like cbc, takes the last occurrence of a repeated flag).
+    default_flags = ("--disallowedTools WebSearch WebFetch",)
+
     static_env = {
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
         "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
@@ -46,9 +51,10 @@ class AGSSidecarClaudeCodeHarness(BaseHarness):
         )
 
     async def launch_and_wait(self, sb: Sandbox, ctx: HarnessContext, prompt: str, time_budget_sec: int) -> int:
-        cmd = f"/usr/local/bin/claude -p {shlex.quote(prompt)} {self.launch_flags}"
+        cmd = f"/usr/local/bin/claude -p {shlex.quote(prompt)} {self.launch_flags} {' '.join(self.default_flags)}"
         extra = os.environ.get(self.extra_args_env, "").strip()
         if extra:
+            # Last, so it overrides default_flags.
             cmd = f"{cmd} {extra}"
 
         env = {
@@ -65,9 +71,8 @@ class AGSSidecarClaudeCodeHarness(BaseHarness):
         }
         extra_envs = os.environ.get(self.extra_envs_env, "").strip()
         if extra_envs:
+            # Applied last so it can override static_env.
             env.update(json.loads(extra_envs))
-        if os.environ.get("CLAUDE_CODE_MAX_OUTPUT_TOKENS"):
-            env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = os.environ["CLAUDE_CODE_MAX_OUTPUT_TOKENS"]
 
         return await run_root_command(
             sb,
@@ -101,26 +106,17 @@ class CodeBuddyCodeHarness(BaseHarness):
     name = "codebuddy_code"
     extra_args_env = "SLIME_AGENT_CBC_EXTRA_ARGS"
     extra_envs_env = "SLIME_AGENT_CBC_EXTRA_ENVS"
-    max_turns_env = "SLIME_AGENT_CBC_MAX_TURNS"
-    max_output_tokens_env = "SLIME_AGENT_CBC_MAX_OUTPUT_TOKENS"
-    thinking_enabled_env = "SLIME_AGENT_CBC_THINKING_ENABLED"
-    tools_env = "SLIME_AGENT_CBC_TOOLS"
 
-    # Keep the default tool surface close to Claude Code's coding-agent use case
-    # while disabling internet search by default for reproducible SWE rollouts.
-    allowed_tools = (
-        "Bash",
-        "Read",
-        "Write",
-        "Edit",
-        "Glob",
-        "Grep",
-        "TaskCreate",
-        "TaskUpdate",
-        "TaskGet",
-        "TaskList",
-        "Agent",
-    )
+    # Baseline flags, emitted BEFORE extra_args so a caller can override any of
+    # them: commander's last-flag-wins was verified against cbc 2.125.0
+    # (`--max-turns 99 --max-turns 1` stops after 1).
+    #
+    # --disallowedTools rather than --tools: `--tools` does NOT restrict the
+    # surface, whereas --disallowedTools is enforced.
+    # Denying web access keeps rollouts reproducible and stops the agent looking
+    # up the fix being graded. The flag is variadic, so it has to stay ahead of
+    # the non-variadic tail or it swallows --max-turns' value and the prompt.
+    default_flags = ("--disallowedTools WebSearch WebFetch",)
 
     async def install_cli(self, sb: Sandbox) -> None:
         await sb.exec(
@@ -155,7 +151,6 @@ class CodeBuddyCodeHarness(BaseHarness):
                     "vendor": "OpenAI",
                     "apiKey": ctx.session_id,
                     "url": self._chat_completions_url(ctx.adapter_url),
-                    "maxOutputTokens": int(os.environ.get(self.max_output_tokens_env, "16384")),
                     "supportsToolCall": True,
                     "supportsImages": False,
                     "supportsReasoning": True,
@@ -167,7 +162,10 @@ class CodeBuddyCodeHarness(BaseHarness):
             "cleanupPeriodDays": 30,
             "includeCoAuthoredBy": False,
             "autoCompactEnabled": True,
-            "alwaysThinkingEnabled": _env_flag(self.thinking_enabled_env, default=True),
+            # Reasoning on: the trained policy emits <think> blocks, and the
+            # adapter records them, so disabling it would train on a different
+            # distribution than it serves.
+            "alwaysThinkingEnabled": True,
             "showTokensCounter": False,
             "enablePasteImageFromClipboard": False,
             "enableTerminalProgressBar": False,
@@ -198,18 +196,13 @@ class CodeBuddyCodeHarness(BaseHarness):
             "--verbose",
             "--output-format stream-json",
             "--include-partial-messages",
+            *self.default_flags,
         ]
-        tools = os.environ.get(self.tools_env, ",".join(self.allowed_tools)).strip()
-        if tools:
-            parts.append(f"--tools {shlex.quote(tools)}")
-            parts.append("--disallowedTools WebSearch")
         extra = os.environ.get(self.extra_args_env, "").strip()
         if extra:
-            # Keep caller-provided flags before the non-variadic tail and prompt.
+            # After default_flags so it can override them, before the prompt so the
+            # prompt stays positional.
             parts.append(extra)
-        if not _env_flag(self.thinking_enabled_env, default=True):
-            parts.append("--effort none")
-        parts.append(f"--max-turns {int(os.environ.get(self.max_turns_env, '100'))}")
         parts.append("-y")
 
         session_log_dir = f"{ctx.workdir}/.harness/codebuddy_sessions"
@@ -267,13 +260,6 @@ class CodeBuddyCodeHarness(BaseHarness):
 def _json_b64(value: dict) -> str:
     payload = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     return base64.b64encode(payload).decode("ascii")
-
-
-def _env_flag(name: str, *, default: bool) -> bool:
-    raw = os.environ.get(name)
-    if raw is None or raw == "":
-        return default
-    return raw.lower() in {"1", "true", "yes", "on"}
 
 
 HARNESS_REGISTRY: dict[str, tuple[type[BaseHarness], type]] = {

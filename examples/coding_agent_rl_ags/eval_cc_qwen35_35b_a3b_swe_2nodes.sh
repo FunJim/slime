@@ -33,7 +33,7 @@
 #   LOAD_DIR=/data_train/ericxjzheng/experiments/<run>/checkpoints \
 #   CKPT_STEP=79 TRAIN_NUM_ROLLOUT=100 \
 #   E2B_API_KEY=... WANDB_API_KEY=... WANDB_ENTITY=... \
-#   bash examples/claude_code_ags/eval_qwen35_35b_a3b_swe_2nodes.sh
+#   bash examples/coding_agent_rl_ags/eval_cc_qwen35_35b_a3b_swe_2nodes.sh
 
 # Best-effort cleanup so a rerun does not collide with stale workers/services.
 pkill -9 sglang || true
@@ -119,7 +119,7 @@ REF_MODEL_PATH="${REF_MODEL_PATH:-/data_train/ericxjzheng/models/Qwen3.5-35B-A3B
 LOAD_DIR="${LOAD_DIR:-}"
 CKPT_STEP="${CKPT_STEP:-}"
 
-EXP_TAG="${EXP_TAG:-claude_code_ags_eval_qwen35_35b_a3b${CKPT_STEP:+_step${CKPT_STEP}}}"
+EXP_TAG="${EXP_TAG:-coding_agent_rl_ags_eval_cc_qwen35_35b_a3b${CKPT_STEP:+_step${CKPT_STEP}}}"
 STAMP="$(date +%Y%m%d_%H%M%S)"
 RUN_ROOT="${RUN_ROOT:-${EXP}/runs/${EXP_TAG}_${STAMP}}"
 
@@ -199,8 +199,20 @@ export SWE_ROLLOUT_CONCURRENCY="${SWE_ROLLOUT_CONCURRENCY:-32}"
 export SWE_PROMPT_STYLE="${SWE_PROMPT_STYLE:-instruction}"
 export SWE_EVAL_PROMPT_STYLE="${SWE_EVAL_PROMPT_STYLE:-dataset}"
 
-export SLIME_AGENT_CC_MAX_TURNS="${SLIME_AGENT_CC_MAX_TURNS:-100}"
-export SLIME_AGENT_CC_EXTRA_ARGS="${SLIME_AGENT_CC_EXTRA_ARGS:---max-turns ${SLIME_AGENT_CC_MAX_TURNS}}"
+# The only two harness knobs: extra CLI flags, and extra env vars as JSON.
+# Everything else (denied tools, the launch flags) is a class attribute in
+# slime_plugins/.../harnesses.py, because it is a property of the harness rather
+# than of a run. Both are applied LAST -- EXTRA_ARGS after the harness's own
+# flags (claude takes the last occurrence of a repeated flag, verified against
+# the real CLI) and EXTRA_ENVS after static_env -- so either can override a
+# harness default.
+export SLIME_AGENT_CC_EXTRA_ARGS="${SLIME_AGENT_CC_EXTRA_ARGS:-}"
+export SLIME_AGENT_CC_EXTRA_ENVS="${SLIME_AGENT_CC_EXTRA_ENVS:-}"
+
+# The CodeBuddy equivalents, so SWE_AGENT=codebuddy_code works from this script
+# too (run_cbc_*.sh just sets SWE_AGENT and re-execs this one).
+export SLIME_AGENT_CBC_EXTRA_ARGS="${SLIME_AGENT_CBC_EXTRA_ARGS:-}"
+export SLIME_AGENT_CBC_EXTRA_ENVS="${SLIME_AGENT_CBC_EXTRA_ENVS:-}"
 
 # ============ proxy bypass for in-cluster/AGS traffic ============
 export no_proxy="127.0.0.1,${MASTER_ADDR},${ADAPTER_PUBLIC_HOST},${E2B_DOMAIN},.tencentags.com"
@@ -468,8 +480,9 @@ keys = (
     "SWE_BOOT_CONCURRENCY",
     "SWE_BOOT_RETRIES", "SWE_ROLLOUT_GUARD_SEC", "SWE_ROLLOUT_CONCURRENCY",
     "SWE_EMPTY_PATCH_GUARD", "SWE_PROMPT_STYLE", "SWE_EVAL_PROMPT_STYLE",
-    "SLIME_AGENT_CC_MAX_TURNS", "SLIME_AGENT_CC_EXTRA_ARGS", "SLIME_AGENT_CC_EXTRA_ENVS",
-    "CLAUDE_CODE_MAX_OUTPUT_TOKENS", "SWE_CC_PROMPT",
+    "SLIME_AGENT_CC_EXTRA_ARGS", "SLIME_AGENT_CC_EXTRA_ENVS",
+    "SLIME_AGENT_CBC_EXTRA_ARGS", "SLIME_AGENT_CBC_EXTRA_ENVS",
+    "SWE_CC_PROMPT",
 )
 env = {k: os.environ[k] for k in keys if k in os.environ}
 env["MASTER_ADDR"] = os.environ["MASTER_ADDR"]
