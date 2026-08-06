@@ -7,11 +7,17 @@ import json
 import re
 import sys
 import types
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from aiohttp import web
-from tests.test_agent._fakes import FakeSandbox
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from tests.test_agent._fakes import FakeSandbox  # noqa: E402
 
 from slime.utils.misc import SingletonMeta
 from slime.utils.types import Sample
@@ -1145,3 +1151,7 @@ def test_autocompact_percentage_reaches_each_cli(monkeypatch):
         assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=60" in launch
 
     asyncio.run(run_case())
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

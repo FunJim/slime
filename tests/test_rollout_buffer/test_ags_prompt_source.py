@@ -150,3 +150,7 @@ def test_seek_is_noop_at_group_zero(prompt_data):
     assert source.data_source.sample_offset == 0
     assert source.data_source.sample_group_index == 0
     assert source.data_source.sample_index == 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

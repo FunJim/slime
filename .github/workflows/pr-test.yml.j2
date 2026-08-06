@@ -97,6 +97,7 @@
       'label': 'run-ci-agent',
       'always': True,
       'cpu': True,
+      'extra_pip_deps': 'openai transformers wandb fastapi uvicorn',
       'tests': [
         {'test_file': 'test_agent/test_trajectory_manager_branching.py', 'num_gpus': 0},
         {'test_file': 'test_agent/test_adapters.py', 'num_gpus': 0},
@@ -104,6 +105,7 @@
         {'test_file': 'test_agent/test_agent_rollout_cpu.py', 'num_gpus': 0},
         {'test_file': 'test_rollout_buffer/test_ags_prompt_source.py', 'num_gpus': 0},
         {'test_file': 'test_rollout_buffer/test_ags_empty_patch_guard.py', 'num_gpus': 0},
+        {'test_file': 'test_rollout_buffer/test_ags_generator.py', 'num_gpus': 0},
       ],
     },
 
