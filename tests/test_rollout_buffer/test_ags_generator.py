@@ -17,6 +17,19 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+# rollout.generate() uses asyncio.timeout(), a 3.11+ API, and swallows the
+# resulting AttributeError into an abort -- so on 3.10 the tests below fail on a
+# missing capture rather than on the real cause. CI pins 3.10, so shim it onto a
+# pass-through: the wall-clock guard never fires here (every case finishes well
+# under rollout_guard_sec). Mirrors the shim in test_agent/test_agent_rollout_cpu.py.
+if not hasattr(asyncio, "timeout"):
+
+    @contextlib.asynccontextmanager
+    async def _timeout_shim(_delay):
+        yield
+
+    asyncio.timeout = _timeout_shim
+
 from tests.test_agent._fakes import FakeSandbox  # noqa: E402
 
 from slime.utils.misc import SingletonMeta
