@@ -434,7 +434,7 @@ if [[ -n "${WANDB_API_KEY:-}" ]]; then
       --wandb-project "${WANDB_PROJECT:-slime-claude-code-ags}"
       --wandb-group "${WANDB_GROUP:-${EXP_TAG}}"
       --wandb-key "${WANDB_API_KEY}"
-      --wandb-dir "${LOG_DIR}/wandb"
+      --wandb-dir "${LOG_DIR}"
       --disable-wandb-random-suffix
    )
 else
