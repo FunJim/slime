@@ -229,6 +229,48 @@ def expand_bins_by_splitting(bins: list[list[int]], target_count: int, lengths) 
         bins.append(right)
 
 
+def shrink_bins_by_merging(bins: list[list[int]], target_count: int, lengths) -> None:
+    """Shrink ``bins`` in place down to exactly ``target_count`` bins.
+
+    The counterpart to :func:`expand_bins_by_splitting`, for when a bin packing has
+    too *many* bins to align and cannot be split any further (every bin is a
+    singleton).
+
+    Minimises the **largest** resulting bin, because that bin is what sets peak
+    activation memory. Uses longest-processing-time-first: walk the bins from largest
+    to smallest and drop each into the currently lightest target slot.
+
+    Repeatedly merging the two smallest bins is the intuitive alternative and is
+    *worse* whenever more than one merge is needed: it keeps stacking samples onto the
+    same growing bin. With ``lengths = [49000, 49000, 90000, 90000, 90000]`` merged to
+    3 bins, that greedy rule peaks at 180000 tokens where this one peaks at 139000 —
+    a 41000-token difference in peak memory, i.e. 1.88x vs 1.45x a 96000 cap. The two
+    rules agree when exactly one merge is needed (``target_count == len(bins) - 1``),
+    which is the common ``dp_size == 2`` case.
+
+    Unlike splitting, merging **can push a bin past the token cap** — that is
+    unavoidable, because first-fit already produced a maximal packing, so any
+    reduction in bin count must combine samples that did not fit together. Callers
+    that care about the cap must budget for the returned bins exceeding it, and
+    should only shrink by the minimum needed to satisfy an alignment constraint.
+
+    ``target_count`` must be >= 1 and <= ``len(bins)``; shrinking below 1 has no
+    meaning and growing is :func:`expand_bins_by_splitting`'s job.
+    """
+    assert target_count >= 1, f"target_count {target_count} must be >= 1"
+    if len(bins) <= target_count:
+        return
+
+    slots: list[list[int]] = [[] for _ in range(target_count)]
+    slot_sums = [0] * target_count
+    for bin_ in sorted(bins, key=lambda b: -sum(lengths[i] for i in b)):
+        lightest = min(range(target_count), key=lambda i: slot_sums[i])
+        slots[lightest].extend(bin_)
+        slot_sums[lightest] += sum(lengths[i] for i in bin_)
+
+    bins[:] = slots
+
+
 def get_reverse_idx(idx_map):
     reverse_idx_map = copy.deepcopy(idx_map)
 
