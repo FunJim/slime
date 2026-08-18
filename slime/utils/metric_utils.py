@@ -24,7 +24,14 @@ def compute_pass_rate(
 
     pass_rate_name_list = [2**i for i in range(int(math.log2(group_size)) + 1)]
 
-    assert len(flat_rewards) == num_groups * group_size, f"{len(flat_rewards)=} {num_groups=} {group_size=}"
+    if len(flat_rewards) != num_groups * group_size:
+        logger.warning(
+            "skip fixed-shape passrate: len(flat_rewards)=%d num_groups=%d group_size=%d",
+            len(flat_rewards),
+            num_groups,
+            group_size,
+        )
+        return {}
     rewards_of_group = np.array(flat_rewards).reshape(num_groups, group_size)
 
     log_dict = {}
@@ -36,6 +43,68 @@ def compute_pass_rate(
 
         pass_k = np.mean(pass_k_estimates)
         log_dict[f"pass@{k}"] = pass_k
+
+    return log_dict
+
+
+def compute_grouped_pass_rate(
+    flat_rewards: list[float],
+    group_indices: list[int | str],
+    rollout_ids: list[int | str],
+    group_size: int,
+):
+    """Compute pass@k on prompt groups while tolerating fan-out samples.
+
+    Agentic rollouts can emit multiple train samples for one rollout attempt
+    (for example one sample per root-to-leaf chain in a tool-use tree).  Those
+    fan-out siblings are training segments, not independent pass@k samples.  So
+    this metric first deduplicates by ``(group_index, rollout_id)`` and then
+    computes pass@k from the attempt-level rewards in each prompt group.
+    """
+
+    if group_size == 1:
+        return {}
+
+    if not (len(flat_rewards) == len(group_indices) == len(rollout_ids)):
+        logger.warning(
+            "skip grouped passrate: rewards=%d group_indices=%d rollout_ids=%d",
+            len(flat_rewards),
+            len(group_indices),
+            len(rollout_ids),
+        )
+        return {}
+
+    grouped_attempt_rewards: dict[int | str, dict[int | str, float]] = {}
+    for position, (reward, group_index, rollout_id) in enumerate(
+        zip(flat_rewards, group_indices, rollout_ids, strict=True)
+    ):
+        # Missing rollout ids are not expected on the normal train path because
+        # rollout.py fills them in before packaging. Keep this fallback local so
+        # a malformed custom path does not merge unrelated attempts.
+        attempt_key = rollout_id if rollout_id is not None else f"position:{position}"
+        attempts = grouped_attempt_rewards.setdefault(group_index, {})
+        reward = float(reward)
+        attempts[attempt_key] = max(attempts.get(attempt_key, reward), reward)
+
+    if not grouped_attempt_rewards:
+        return {}
+
+    pass_rate_name_list = [2**i for i in range(int(math.log2(group_size)) + 1)]
+    log_dict = {}
+    for k in pass_rate_name_list:
+        num_samples = []
+        num_correct = []
+        for attempts in grouped_attempt_rewards.values():
+            rewards = list(attempts.values())
+            if len(rewards) < k:
+                continue
+            num_samples.append(len(rewards))
+            num_correct.append(sum(1 for reward in rewards if reward == 1))
+        if not num_samples:
+            continue
+
+        pass_k_estimates = _estimate_pass_at_k(np.array(num_samples), np.array(num_correct), k)
+        log_dict[f"pass@{k}"] = np.mean(pass_k_estimates).item()
 
     return log_dict
 

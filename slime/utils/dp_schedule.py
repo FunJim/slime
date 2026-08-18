@@ -17,7 +17,12 @@ The scheduling philosophy is **pack first, distribute second**:
      single first-fit pass (dynamic batch) or fixed-size chunking
      (static batch).
   3. Adjust ``K`` to a multiple of ``dp_size * (mb_group if vpp>1 else 1)``
-     by splitting the largest multi-sample bins (dynamic only).
+     by splitting the largest multi-sample bins (dynamic only). When no bin
+     can be split -- every bin holds one sample, the usual case once a
+     single sample fills ``max_per_bin`` -- round ``K`` *down* instead,
+     repacking so the largest bin stays as small as possible. Rounding down
+     needs at least ``align_to`` bins to land on; below that the step cannot
+     be aligned at all and :func:`build_dp_schedule` raises.
   4. Distribute the ``K`` mbs across ``dp_size`` ranks, ``K / dp_size``
      each, with either a strided round-robin or a Karmarkar-Karp pass on
      estimated mbs FLOPs.
@@ -26,15 +31,21 @@ Invariants guaranteed by :func:`build_dp_schedule` (asserted by the tests):
   - every DP rank runs the **same** ``num_microbatches`` per training step
     (required for PP sync);
   - every mbs (dynamic path without ``balance_by_flops``) holds
-    ``<= max_tokens_per_gpu * cp_size`` tokens, with one exception — an
-    individual sample larger than that cap lands alone in its own mbs (and
-    that mbs is the only one allowed to exceed the cap);
+    ``<= max_tokens_per_gpu * cp_size`` tokens, with two exceptions — an
+    individual sample larger than that cap lands alone in its own mbs, and
+    a step whose bin count had to be repacked down for alignment (step 3
+    above) may hold mbs above the cap. On that path ``max_tokens_per_gpu``
+    is a target, not a hard bound, and the repack is logged at WARNING;
   - the union of per-rank sample indices equals the set of samples kept
     after trimming trailing rollouts (every kept sample placed exactly
     once);
   - flattening ``micro_batch_indices`` for a rank yields
     ``range(num_samples_rank)`` (each rank's samples are tiled exactly
     once by its mbs schedule).
+
+Note that an mbs may hold samples from different rollouts after a repack.
+That is harmless: the loss is aggregated by ``rollout_id`` across the whole
+step, not per micro-batch, so mbs composition only affects memory.
 """
 
 from __future__ import annotations
@@ -43,7 +54,12 @@ import logging
 from typing import Any
 
 from slime.utils.flops_utils import calculate_fwd_flops
-from slime.utils.seqlen_balancing import expand_bins_by_splitting, first_fit_pack, get_seqlen_balanced_partitions
+from slime.utils.seqlen_balancing import (
+    expand_bins_by_splitting,
+    first_fit_pack,
+    get_seqlen_balanced_partitions,
+    shrink_bins_by_merging,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -169,11 +185,63 @@ def build_dp_schedule(
         if target_K != len(step_mbs):
             if args.use_dynamic_batch_size:
                 expand_bins_by_splitting(step_mbs, target_K, step_lengths)
-                assert len(step_mbs) == target_K, (
-                    f"dynamic path: could only produce {len(step_mbs)} mbs after maximal splitting; "
-                    f"need {target_K}. step {step_i} has {len(sample_indices)} samples, below the "
-                    f"alignment threshold ({align_to})."
-                )
+                if len(step_mbs) != target_K:
+                    # Splitting up to ``target_K`` was impossible: every bin holds a
+                    # single sample, so there is nothing left to divide. This is the
+                    # normal state for long-context runs, where one sample alone fills
+                    # ``max_per_bin`` (e.g. 69k-token SWE trajectories against a 96k
+                    # cap) -- first-fit then emits one bin per sample and an odd sample
+                    # count can never reach an even ``target_K``.
+                    #
+                    # Rounding DOWN to the nearest multiple is the fallback, but it only
+                    # exists when there are at least ``align_to`` bins to round down to.
+                    # Below that the floor is 0, which is not a schedule -- the step
+                    # genuinely cannot be aligned and the run must stop. Report that
+                    # directly rather than letting the merge below fail with a message
+                    # that blames merging for a shortage of samples.
+                    if len(step_mbs) < align_to:
+                        raise AssertionError(
+                            f"dynamic path: step {step_i} produced {len(step_mbs)} unsplittable "
+                            f"single-sample mbs, below the alignment threshold ({align_to}); "
+                            f"cannot align by splitting (all bins are singletons) or by merging "
+                            f"down (the floor is 0 mbs). step has {len(sample_indices)} samples, "
+                            f"dp_size={dp_size}, mb_group={mb_group if vpp_size > 1 else 1}. "
+                            f"Raise global_batch_size so each step holds >= {align_to} samples, "
+                            f"or lower dp_size / disable VPP to reduce the alignment requirement."
+                        )
+                    # Round DOWN to the nearest multiple, repacking the bins so the
+                    # LARGEST one stays as small as possible -- that bin sets peak
+                    # activation memory. Rounding down keeps every sample in the step;
+                    # the alternative, dropping the odd sample, would silently discard
+                    # completed rollout work.
+                    #
+                    # The cost is real: merged bins can exceed ``max_per_bin``, because
+                    # first-fit already produced a maximal packing, so any reduction in
+                    # bin count must combine samples that did not fit together. We only
+                    # shrink by the minimum needed for alignment. Callers must therefore
+                    # treat max_tokens_per_gpu as a target rather than a hard guarantee
+                    # on this path.
+                    aligned_K = (len(step_mbs) // align_to) * align_to
+                    logger.warning(
+                        "step %d: %d samples packed into %d unsplittable single-sample mbs, which is not "
+                        "a multiple of %d; repacking down to %d mbs. Some mbs will exceed "
+                        "max_tokens_per_gpu * cp_size (%s), which lowering max_tokens_per_gpu cannot "
+                        "prevent -- the merged mbs holds whole samples, so its token count is set by the "
+                        "data. If this OOMs, lower rollout_max_context_len (shorter samples) or choose a "
+                        "global_batch_size whose per-step sample count is a multiple of %d.",
+                        step_i,
+                        len(sample_indices),
+                        len(step_mbs),
+                        align_to,
+                        aligned_K,
+                        max_per_bin,
+                        align_to,
+                    )
+                    shrink_bins_by_merging(step_mbs, aligned_K, step_lengths)
+                    assert len(step_mbs) == aligned_K, (
+                        f"dynamic path: repacking produced {len(step_mbs)} mbs, expected {aligned_K}. "
+                        f"step {step_i} has {len(sample_indices)} samples."
+                    )
             else:
                 raise AssertionError(
                     f"static path: num_mbs ({len(step_mbs)}) is not a multiple of "

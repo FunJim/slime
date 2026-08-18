@@ -244,12 +244,21 @@ class Dataset:
             else:
                 output_prompt = prompt
 
-            if processor:
+            # Vision extraction is gated on multimodal_keys, not on the mere
+            # existence of a processor. AutoProcessor returns one for any
+            # VL-capable checkpoint -- Qwen3.5-35B-A3B yields a Qwen3VLProcessor
+            # -- so keying off `processor` alone forced a conversation-shaped
+            # prompt on text-only datasets. That made --apply-chat-template
+            # mandatory, which in turn rewrote the prompt into a templated
+            # "<|im_start|>user ..." string; agent rollouts that hand
+            # Sample.prompt straight to a CLI then fed it those literal markers.
+            # This mirrors the `as_conversation` condition computed above.
+            if processor and multimodal_keys is not None:
                 from slime.utils.processing_utils import process_vision_info
 
                 assert isinstance(
                     prompt, list
-                ), f"prompt must be a list when processor is not None, got {type(prompt)} instead"
+                ), f"prompt must be a list when multimodal_keys is set, got {type(prompt)} instead"
                 multimodal_inputs = process_vision_info(prompt, processor)
             else:
                 multimodal_inputs = None

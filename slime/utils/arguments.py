@@ -1391,6 +1391,25 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Number of times to retry fetching trajectory, -1 means unlimited retry",
             )
             parser.add_argument(
+                "--rollout-buffer-num-epoch",
+                type=int,
+                default=1,
+                help=(
+                    "Generator-side epochs to run for each rollout-buffer start request. "
+                    "Keep this at 1 for colocated/offloaded rollout so background generation "
+                    "does not continue after one training rollout has returned."
+                ),
+            )
+            parser.add_argument(
+                "--rollout-buffer-stop-timeout-sec",
+                type=float,
+                default=120.0,
+                help=(
+                    "Seconds to wait for the rollout-buffer background job to stop after "
+                    "enough data has been collected for the current training rollout."
+                ),
+            )
+            parser.add_argument(
                 "--min-batch-collection-ratio",
                 type=float,
                 default=1,
@@ -1400,6 +1419,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--rollout-task-type",
                 type=str,
                 default="math",
+            )
+            parser.add_argument(
+                "--enable-token2text",
+                action="store_true",
+                default=False,
+                help="Decode token IDs to readable text in rollout traces. Disabled by default.",
             )
             parser.add_argument(
                 "--loss-mask-type",

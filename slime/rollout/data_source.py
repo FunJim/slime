@@ -204,10 +204,12 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
         assert isinstance(samples, list), f"samples must be a list, got {type(samples)}"
         assert isinstance(samples[0], list), f"the elements of samples must be list, got {type(samples[0])}"
         for i in range(0, len(samples)):
-            assert (
-                len(samples[i]) == self.args.n_samples_per_prompt
-            ), f"the length of the elements of samples must be equal to n_samples_per_prompt, got {len(samples[i])} != {self.args.n_samples_per_prompt}"
+            assert len(samples[i]) >= self.args.n_samples_per_prompt, (
+                "the elements of samples must include at least n_samples_per_prompt entries, "
+                f"got {len(samples[i])} < {self.args.n_samples_per_prompt}"
+            )
             group = samples[i]  # type: ignore
+            assert all(isinstance(sample, Sample) for sample in group), "sample groups must contain Sample instances"
             self.buffer.append(group)
 
     # TODO remove

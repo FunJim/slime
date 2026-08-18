@@ -25,10 +25,10 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from tests.test_agent._fakes import FakeSGLangServer, FakeTokenizer  # noqa: E402
+from tests.test_agent._fakes import FakeSGLangServer, FakeTokenizer, RoundTrippingTokenizer  # noqa: E402
 
 from slime.agent.adapters import anthropic, openai  # noqa: E402
-from slime.agent.parsing import parse_model_output, parse_xml_tool_uses  # noqa: E402
+from slime.agent.parsing import ParsedModelOutput, parse_model_output, parse_xml_tool_uses  # noqa: E402
 from slime.utils.types import Sample  # noqa: E402
 
 NUM_GPUS = 0
@@ -129,6 +129,20 @@ def test_anthropic_translation_keeps_tool_results_thinking_and_tools():
     assert tools == [
         {"type": "function", "function": {"name": "lookup", "description": "search", "parameters": {"type": "object"}}}
     ]
+
+
+def test_openai_translation_accepts_reasoning_under_either_key():
+    """CodeBuddy Code echoes reasoning back as ``reasoning``, not
+    ``reasoning_content``; both must normalise onto the canonical key or the echo
+    compares unequal to our leaf and every reasoning turn forks."""
+    for key in ("reasoning_content", "reasoning"):
+        translated = openai._translate_messages([{"role": "assistant", "content": "ok", key: "plan"}])
+        assert translated == [{"role": "assistant", "content": "ok", "reasoning_content": "plan"}], key
+    # canonical key wins when a client sends both
+    both = openai._translate_messages(
+        [{"role": "assistant", "content": "ok", "reasoning_content": "canonical", "reasoning": "alias"}]
+    )
+    assert both[0]["reasoning_content"] == "canonical"
 
 
 def test_openai_translation_developer_to_system_and_tool_calls_to_dict():
@@ -375,9 +389,99 @@ def test_anthropic_multiturn_wire_roundtrip_and_token_capture():
     asyncio.run(run_case())
 
 
+def test_openai_manager_message_keeps_text_and_reasoning_with_tool_calls():
+    """The manager leaf must carry everything the model generated.
+
+    It is what re-renders as history next turn, so a dropped field stops the
+    re-render from reproducing the sampled ids -- token drift, which then either
+    rewrites a trained response as loss_mask=0 or forks the trajectory. See
+    test_openai_multiturn_thinking_tool_calls_do_not_fork for the consequence.
+    """
+    parsed = ParsedModelOutput(
+        reasoning="plan", text="Let me look.", tool_uses=[{"name": "lookup", "input": {"q": "x"}}]
+    )
+    wire_message, manager_message, wire_finish = openai._build_reply_parts(parsed, "stop")
+
+    assert manager_message["content"] == "Let me look."
+    assert manager_message["reasoning_content"] == "plan"
+    assert manager_message["tool_calls"] == [
+        {"type": "function", "function": {"name": "lookup", "arguments": {"q": "x"}}}
+    ]
+    # the wire keeps the same content so the client's echo still matches the leaf;
+    # arguments are a JSON string there (spec) and the id is wire-only.
+    assert wire_message["content"] == "Let me look."
+    assert wire_message["reasoning_content"] == "plan"
+    assert wire_finish == "tool_calls"
+    assert json.loads(wire_message["tool_calls"][0]["function"]["arguments"]) == {"q": "x"}
+
+
 # ===========================================================================
-# §6 adapter behaviour: turn cap, mid-list system fold
+# §6 adapter behaviour: turn cap, mid-list system fold, sampling precedence
 # ===========================================================================
+
+
+def test_open_session_sampling_defaults_outrank_body():
+    """A caller-set temperature must survive a harness that sends its own.
+
+    codebuddy puts temperature=1 on every /v1/chat/completions request, so
+    without this precedence an --eval-temperature would never reach sglang.
+    """
+
+    async def run_case():
+        async with FakeSGLangServer([[(-0.1, 601)]]) as sglang:
+            tok = FakeTokenizer(outputs={(601,): "ok"})
+            adapter = openai.OpenAIAdapter(tokenizer=tok, sglang_url=sglang.url)
+            adapter.open_session("sid-sp", sampling_defaults={"temperature": 0.7, "top_p": 0.8})
+            client = TestClient(TestServer(adapter.app))
+            await client.start_server()
+            try:
+                await client.post(
+                    "/v1/chat/completions",
+                    headers={"Authorization": "Bearer sid-sp"},
+                    # temperature/top_k as a harness would send them; top_k is
+                    # absent from the defaults so the body value still applies.
+                    json={
+                        "model": "m",
+                        "temperature": 1,
+                        "top_k": 40,
+                        "messages": [{"role": "user", "content": "hi"}],
+                    },
+                )
+            finally:
+                await client.close()
+            await _drain(adapter, "sid-sp")
+
+        sp = sglang.requests[0]["sampling_params"]
+        assert sp["temperature"] == 0.7, "body temperature must not override the caller's default"
+        assert sp["top_p"] == 0.8
+        assert sp["top_k"] == 40, "keys absent from sampling_defaults still come from the body"
+
+    asyncio.run(run_case())
+
+
+def test_body_sampling_params_apply_without_open_session_defaults():
+    """With no caller defaults, the harness's own knobs are still honoured."""
+
+    async def run_case():
+        async with FakeSGLangServer([[(-0.1, 602)]]) as sglang:
+            tok = FakeTokenizer(outputs={(602,): "ok"})
+            adapter = openai.OpenAIAdapter(tokenizer=tok, sglang_url=sglang.url)
+            adapter.open_session("sid-nd")
+            client = TestClient(TestServer(adapter.app))
+            await client.start_server()
+            try:
+                await client.post(
+                    "/v1/chat/completions",
+                    headers={"Authorization": "Bearer sid-nd"},
+                    json={"model": "m", "temperature": 0.3, "messages": [{"role": "user", "content": "hi"}]},
+                )
+            finally:
+                await client.close()
+            await _drain(adapter, "sid-nd")
+
+        assert sglang.requests[0]["sampling_params"]["temperature"] == 0.3
+
+    asyncio.run(run_case())
 
 
 def test_max_turns_per_sid_returns_429():
@@ -416,6 +520,82 @@ def test_mid_list_system_folds_into_user():
     assert [m["role"] for m in body["messages"]] == ["user", "user"]
     folded = body["messages"][0]["content"]
     assert any(b.get("text", "").startswith("<system-reminder>") for b in folded)
+
+
+@pytest.mark.parametrize(
+    "shape,turn_text",
+    [
+        ("tool_only", "<tool_call> <function=lookup> <parameter=q> slime </parameter> </function> </tool_call>"),
+        (
+            "text_and_tool",
+            "Let me look. <tool_call> <function=lookup> <parameter=q> slime </parameter> </function> </tool_call>",
+        ),
+        (
+            "think_and_tool",
+            "<think> plan </think> <tool_call> <function=lookup> <parameter=q> slime </parameter> </function>"
+            " </tool_call>",
+        ),
+    ],
+)
+def test_openai_multiturn_thinking_tool_calls_do_not_fork(shape, turn_text):
+    """A clean multi-turn OpenAI chain must yield ONE sample with every turn trained.
+
+    Regression test for the adapter dropping text / reasoning from
+    manager_message: on a 500-instance CodeBuddy run that split each rollout into
+    ~25 samples (versus 1 for the Anthropic path) and silently rewrote real
+    responses as loss_mask=0. Both symptoms are asserted -- sample count AND
+    trained-token count -- because a leaf that drops a field can also keep the
+    count at 1 while training almost nothing.
+    """
+    turns = 4
+
+    async def run_case():
+        tok = RoundTrippingTokenizer()
+        scripted = [[(-0.1, tid) for tid in tok.encode(turn_text)] for _ in range(turns)]
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "parameters": {"type": "object", "properties": {"q": {"type": "string"}}},
+                },
+            }
+        ]
+        async with FakeSGLangServer(scripted) as sglang:
+            # tool_parser=None routes through the XML fallback, so no sglang needed;
+            # reasoning_parser=None keeps <think> inside .text, which for this test
+            # is equivalent -- the point is whether the leaf preserves what was
+            # generated, not which field it lands in.
+            adapter = openai.OpenAIAdapter(tokenizer=tok, sglang_url=sglang.url)
+            sid = f"sid-{shape}"
+            adapter.open_session(sid)
+            client = TestClient(TestServer(adapter.app))
+            await client.start_server()
+            messages: list[dict] = [{"role": "user", "content": "fix it"}]
+            try:
+                for _ in range(turns):
+                    resp = await client.post(
+                        "/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {sid}"},
+                        json={"model": "m", "tools": tools, "messages": messages},
+                    )
+                    assert resp.status == 200
+                    assistant = (await resp.json())["choices"][0]["message"]
+                    # echo history back verbatim, as the real CLI was measured to do
+                    messages = [*messages, assistant]
+                    for call in assistant.get("tool_calls") or []:
+                        messages.append({"role": "tool", "tool_call_id": call["id"], "content": "ok"})
+            finally:
+                await client.close()
+            return await _drain(adapter, sid)
+
+    samples = asyncio.run(run_case())
+    assert len(samples) == 1, f"{shape}: chain forked into {len(samples)} samples"
+    response_tokens = len(tok_ids := samples[0].loss_mask)
+    trained = sum(tok_ids)
+    # every turn's response is trained; the only untrained ids are the tool results
+    # threaded back in as prompt between turns.
+    assert trained > 0.5 * response_tokens, f"{shape}: only {trained}/{response_tokens} response tokens trained"
 
 
 # ===========================================================================

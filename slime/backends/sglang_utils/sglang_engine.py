@@ -9,6 +9,7 @@ from urllib.parse import quote
 import requests
 import sglang_router
 from packaging.version import parse
+from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
 from urllib3.exceptions import NewConnectionError
@@ -98,6 +99,12 @@ def _wait_server_healthy(base_url, api_key, is_process_alive):
             time.sleep(2)
 
 
+def _resume_restores_generation(tags: list[str] | None) -> bool:
+    if tags is None:
+        return True
+    return GPU_MEMORY_TYPE_KV_CACHE in tags or GPU_MEMORY_TYPE_CUDA_GRAPH in tags
+
+
 class SGLangEngine(RayActor):
     def __init__(
         self,
@@ -114,6 +121,7 @@ class SGLangEngine(RayActor):
         self.base_gpu_id = base_gpu_id
         self.sglang_overrides = sglang_overrides or {}
         self.num_gpus_per_engine = num_gpus_per_engine
+        self._generation_paused_by_offload = False
 
     def init(
         self,
@@ -355,6 +363,8 @@ class SGLangEngine(RayActor):
         return response.json()["weight_version"]
 
     def release_memory_occupation(self):
+        self.pause_generation()
+        self._generation_paused_by_offload = True
         self.flush_cache()
         return self._make_request("release_memory_occupation")
 
@@ -362,10 +372,14 @@ class SGLangEngine(RayActor):
         """
         Available tags for multi-stage resume: weights, kv_cache
         """
-        return self._make_request(
+        result = self._make_request(
             "resume_memory_occupation",
             {"tags": tags},
         )
+        if self._generation_paused_by_offload and _resume_restores_generation(tags):
+            self.continue_generation()
+            self._generation_paused_by_offload = False
+        return result
 
     def check_weights(self, action: str):
         return self._make_request("weights_checker", {"action": action})

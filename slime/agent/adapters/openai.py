@@ -99,12 +99,28 @@ def _arguments_as_dict(arguments: Any) -> dict[str, Any]:
     return {"_raw_arguments": str(arguments)}
 
 
+# Keys an OpenAI-compatible client may echo reasoning back under. The spec never
+# standardised one, so CodeBuddy Code replays ours verbatim as "reasoning" while
+# we send "reasoning_content"; reading only the canonical key would make every
+# reasoning turn's echo compare unequal to our leaf.
+_REASONING_KEYS = ("reasoning_content", "reasoning")
+
+
+def _reasoning_text(msg: dict) -> str:
+    """Reasoning text from an echoed assistant message, under any known key."""
+    for key in _REASONING_KEYS:
+        value = msg.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
 def _translate_messages(messages: list[dict]) -> list[dict]:
     """OpenAI chat messages -> tokenizer chat-template messages.
 
     Mirrors anthropic._translate_messages so a replayed assistant turn compares
     equal (dict equality) to the leaf the manager appended on the previous
-    request. Two invariants must hold:
+    request. Three invariants must hold:
 
       * tool_calls[i].function.arguments is a dict (not a JSON string): the chat
         template needs a mapping, and the manager matches history by dict
@@ -112,6 +128,8 @@ def _translate_messages(messages: list[dict]) -> list[dict]:
       * Wire-only correlation ids are dropped (tool_call_id on tool messages,
         tool_calls[i].id on echoed assistant messages). Fresh ids are minted on
         each response, so keeping the wire ids would diverge the replay match.
+      * Reasoning is normalised onto reasoning_content whichever key it arrived
+        under (see _REASONING_KEYS).
     """
     translated: list[dict] = []
     for msg in messages:
@@ -132,7 +150,7 @@ def _translate_messages(messages: list[dict]) -> list[dict]:
                 "role": "assistant",
                 "content": flatten_content(content),
             }
-            reasoning = msg.get("reasoning_content")
+            reasoning = _reasoning_text(msg)
             if reasoning:
                 assistant["reasoning_content"] = reasoning
             tool_calls = msg.get("tool_calls") or []
@@ -249,24 +267,29 @@ def _build_reply_parts(parsed: ParsedModelOutput, finish: str) -> tuple[dict[str
 
     wire_message: dict[str, Any] = {
         "role": "assistant",
-        # send content=null when there are tool_calls: some OpenAI clients split
-        # a mixed text+tool_calls turn into two echoed messages otherwise, which
-        # diverges the history match against our leaf
-        "content": None if wire_tool_calls else (parsed.text or None),
+        "content": parsed.text or None,
     }
-    # manager_message must match what the client echoes on the next request, or
-    # the manager's history match (dict equality) diverges and every turn forks.
-    # Differences from wire_message, each needed to match the echo:
-    #   * no reasoning_content -- some clients strip it on echo (the reasoning
-    #     token ids are still kept in the trained tokens, only the text drops)
+    # manager_message is what re-renders as history on the next turn, so it must
+    # carry everything the model actually generated -- text and reasoning
+    # included, even alongside tool_calls. Dropping a field here does not just
+    # lose it from the history: the re-render then no longer reproduces the ids we
+    # sampled, so _SampleBuilder sees token drift and either REALIGNs (rewriting
+    # a real trained response as loss_mask=0) or forks. Measured on a 500-instance
+    # CodeBuddy run, dropping reasoning_content alone split each rollout into ~25
+    # samples where Claude Code produced 1.
+    #
+    # It must also equal what the client echoes back, or the manager's history
+    # match (dict equality) diverges instead. The two remaining differences from
+    # wire_message are both required for that:
+    #   * "" rather than None for empty content -- flatten_content's shape
     #   * only the first tool_call -- some clients drop extra parallel tool_calls
-    #   * empty content when tool_calls are present -- mirrors content=null above
     manager_message: dict[str, Any] = {
         "role": "assistant",
-        "content": "" if wire_tool_calls else (parsed.text or ""),
+        "content": parsed.text or "",
     }
     if parsed.reasoning:
         wire_message["reasoning_content"] = parsed.reasoning
+        manager_message["reasoning_content"] = parsed.reasoning
     if wire_tool_calls:
         wire_message["tool_calls"] = wire_tool_calls[:1]
         manager_message["tool_calls"] = manager_tool_calls[:1]

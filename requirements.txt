@@ -22,5 +22,6 @@ sglang-router>=0.2.3
 tensorboard
 transformers
 wandb
+weave
 xxhash  # disk delta weight sync (checksum + codec)
 zstandard

@@ -13,6 +13,7 @@ import io
 import logging
 import os
 import random
+import shlex
 import time
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -58,6 +59,53 @@ class Sandbox(Protocol):
 
 
 EXIT_TIME_BUDGET_EXCEEDED = -1
+
+
+async def terminate_process_group(
+    sb: Sandbox,
+    *,
+    pid_file: str,
+    user: str,
+    grace_sec: int = 5,
+) -> None:
+    """Terminate a detached ``setsid`` process group and wait until it exits."""
+
+    pid_path = shlex.quote(pid_file)
+    missing_pid_message = shlex.quote(f"missing process-group pid file: {pid_file}")
+    invalid_pid_prefix = shlex.quote(f"invalid process-group id in {pid_file}:")
+    command = f"""
+set -u
+if [ ! -s {pid_path} ]; then
+  echo {missing_pid_message} >&2
+  exit 1
+fi
+pgid=$(cat {pid_path})
+case "$pgid" in
+  ""|*[!0-9]*)
+    echo {invalid_pid_prefix} "$pgid" >&2
+    exit 1
+    ;;
+esac
+kill -TERM -- "-$pgid" 2>/dev/null || true
+remaining={grace_sec}
+while [ "$remaining" -gt 0 ]; do
+  if ! kill -0 -- "-$pgid" 2>/dev/null; then
+    exit 0
+  fi
+  sleep 1
+  remaining=$((remaining - 1))
+done
+kill -KILL -- "-$pgid" 2>/dev/null || true
+for _ in 1 2 3 4 5; do
+  if ! kill -0 -- "-$pgid" 2>/dev/null; then
+    exit 0
+  fi
+  sleep 0.2
+done
+echo "process group $pgid is still alive after SIGKILL" >&2
+exit 1
+""".strip()
+    await sb.exec(command, user=user, timeout=grace_sec + 10, check=True, idempotent=False)
 
 
 async def _await_done_marker(sb: Sandbox, done_file: str, *, user: str, time_budget_sec: int) -> int:
@@ -106,6 +154,7 @@ async def exec_and_wait(
     done_file = f"/tmp/.{tag}.done"
     launcher = f"/tmp/.{tag}.sh"
     lock_dir = f"/tmp/.{tag}.spawned"
+    pid_file = f"/tmp/.{tag}.pid"
     prefix = f"cd {workdir}\nexport HOME=/home/{user}\n" if workdir else ""
     launcher_body = f"#!/bin/bash\n{prefix}{cmd}\necho $? > {done_file}\n"
     await sb.write_file(launcher, launcher_body, user=user)
@@ -113,8 +162,9 @@ async def exec_and_wait(
     await sb.exec(
         f"chmod +x {launcher}; "
         f"mkdir {lock_dir} 2>/dev/null || exit 0; "
-        f"rm -f {out_file} {done_file}; "
-        f"setsid bash {launcher} < /dev/null > {out_file} 2>&1 &",
+        f"rm -f {out_file} {done_file} {pid_file}; "
+        f"setsid bash {launcher} < /dev/null > {out_file} 2>&1 & "
+        f"echo $! > {pid_file}",
         user=user,
         env=env,
         timeout=30,
@@ -122,6 +172,9 @@ async def exec_and_wait(
         idempotent=True,
     )
     exit_code = await _await_done_marker(sb, done_file, user=user, time_budget_sec=time_budget_sec)
+    if exit_code == EXIT_TIME_BUDGET_EXCEEDED:
+        logger.warning("Detached command %s exceeded %ss; terminating process group", tag, time_budget_sec)
+        await terminate_process_group(sb, pid_file=pid_file, user=user)
     if exit_code == 0 and not want_output:
         return exit_code, ""
     if want_output:
