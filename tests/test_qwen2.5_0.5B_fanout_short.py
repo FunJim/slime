@@ -100,15 +100,12 @@ def execute():
         "--global-batch-size 4 "
         "--balance-data "
         "--custom-generate-function-path slime.rollout._fanout_test_helpers.compact_generate "
-        # GRPO normalization needs per-prompt grouping. The default
-        # ``_post_process_rewards`` (slime/ray/rollout.py:618) reshapes
-        # by ``n_samples_per_prompt`` and falls back to "one big group"
-        # when the per-prompt count is uneven — fan-out trips exactly
-        # that fallback. The helper here groups by ``Sample.group_index``
-        # (the per-prompt counter the data source stamps; deepcopy in
-        # compact_generate preserves it across siblings) so each prompt's
-        # siblings normalize against each other, matching the GRPO
-        # semantics the default targets in the uniform case.
+        # Redundant since the default ``_post_process_rewards`` started
+        # grouping by ``Sample.group_index`` itself, which handles the
+        # uneven per-prompt counts fan-out produces. Kept because dropping
+        # it changes what this test exercises, and that swap should land
+        # with an actual e2e run behind it rather than on the argument
+        # that it ought to be equivalent.
         "--custom-reward-post-process-path slime.rollout._fanout_test_helpers.grpo_normalize_by_group_index "
     )
 

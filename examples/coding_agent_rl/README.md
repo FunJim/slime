@@ -184,6 +184,7 @@ prompt-base restarts.
 - `generate()` returns `list[Sample]` — one Sample per root-to-leaf chain in the per-session message tree.
 - Per-trajectory reward is split as `reward / K` across chains; `rollout_id` is shared so the per-rollout-mean loss reducer still counts the trajectory once.
 - Sub-agent dispatch and auto-compaction increase `K` (each prompt-prefix divergence forks a new branch), so the effective batch after flatten can be much larger than `rollout_batch_size * n_samples_per_prompt`.
+- The per-prompt Sample count is therefore uneven. GRPO's reward normalization handles that: `_post_process_rewards` groups by `Sample.group_index` (the data source's per-prompt counter), not by reshaping the flat batch to `n_samples_per_prompt`, so each prompt is still centered against itself.
 
 ## Porting to a New Sandbox Backend
 
