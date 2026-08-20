@@ -257,7 +257,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     reason,
                 )
             logger.info(
-                "[coding_agent_rl] %s: reward=%.2f applied=%s agent_exit_code=%d elapsed=%.1fs segments=%d",
+                "[coding_agent_rl] %s: reward=%.2f applied=%s agent_exit_code=%d elapsed=%.1fs samples=%d",
                 instance_id,
                 float(reward),
                 bool(applied_cleanly),

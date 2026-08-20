@@ -5,13 +5,13 @@ This directory provides an example of running end-to-end **SWE (Software-Enginee
 Two example files, the shared harness package, and one shared adapter implement the loop:
 
 - `generate.py` — per-sample `generate()` registered via `--custom-generate-function-path`. Boots the sandbox, prepares the SWE workspace, runs the coding harness (claude-code), captures the diff, scores it, and emits one or more `Sample`s back to slime.
-- `slime.agent.adapters.AnthropicAdapter` — the shared Anthropic Messages adapter. claude-code talks to it as if it were Anthropic; the adapter tokenizes the current message history each turn, records prompt/output token snapshots, preserves model-generated tokens (`loss_mask=1`) only while later prompts stitch onto them, and masks template/observation tokens (`0`). Each turn is routed into a per-session message tree inside `slime.agent.trajectory.TrajectoryManager`; any divergence in the prompt prefix forks a new branch, so sub-agent dispatches and auto-compaction are handled as separate root-to-leaf chains. `get_trajectory` linearizes each leaf chain into one `Sample`.
+- `slime.agent.adapters.AnthropicAdapter` — the shared Anthropic Messages adapter. claude-code talks to it as if it were Anthropic; the adapter tokenizes the current message history each turn, records prompt/output token snapshots, keeps model-generated tokens at `loss_mask=1`, and masks template/observation tokens (`0`). Each turn is routed into a per-session message tree inside `slime.agent.trajectory.TrajectoryManager`; a prompt whose token prefix diverges too far from what a branch holds forks a new branch, so sub-agent dispatches and auto-compaction are handled as separate root-to-leaf chains. `get_trajectory` linearizes each leaf chain into one or more `Sample`s.
 - `slime.agent.harness` — harness-agnostic coding-agent lifecycle (install CLI, write config, spawn detached, poll done-marker). `BaseHarness` defines the contract; `CLAUDE_CODE` / `CODEX` are the shipped implementations. Adding a harness is one new file. The shared sandbox contract lives in `slime.agent.sandbox.Sandbox`.
 - `swe.py` — harness-agnostic SWE task layer built on `slime.agent.sandbox`: `prepare_workspace` (pre_commands + PROBLEM_STATEMENT.md), `git_diff` (patch capture), and `evaluate` (fresh-sandbox grading). `SWE_PROMPT` is the task instruction handed to whichever harness runs.
 
 `generate.py` owns one `AnthropicAdapter` instance. For each sample it calls
 `adapter.open_session(...)` before starting claude-code, serves `adapter.app` as
-the Anthropic-compatible endpoint, and drains trainable `TokenSegment`s with
+the Anthropic-compatible endpoint, and drains trainable `Sample`s with
 `await adapter.finish_session(...)` when the trajectory ends.
 
 ## Environment Setup
@@ -132,9 +132,10 @@ contract (read inside `slime/agent/`); `SWE_*` are this SWE example's task knobs
 
 `--rollout-max-response-len` is the per-turn generation cap passed to each
 SGLang `/generate` call as `max_new_tokens`. `--rollout-max-context-len` is the
-multi-turn prompt+response budget enforced only during generation: each turn
-clamps `max_new_tokens` to the remaining context. Trajectory merge/export keeps
-the emitted segments and does not drop them for length.
+multi-turn prompt+response budget: each turn clamps `max_new_tokens` to the
+remaining context, and each emitted `Sample`'s token sequence is truncated to it
+at export time, so an overlong trajectory cannot produce a training row past the
+training context window.
 The Anthropic adapter reuses `--sglang-tool-call-parser` and
 `--sglang-reasoning-parser` for output parsing, so those flags must match the
 served model.
@@ -161,30 +162,51 @@ The Anthropic adapter therefore follows a **string in, token out** contract:
 Multi-turn agents still force the adapter to tokenize later message
 histories, because tool observations and claude-code's own compacted messages
 arrive as strings. `slime.agent.trajectory.TrajectoryManager` routes
-those later prompts against the saved token stream:
+those later prompts against the saved token stream. Each incoming turn is
+classified by how far its prompt diverges from the tokens a branch already
+holds (`DriftKind`):
 
-- New prompt suffixes that are tool/user/environment context are appended with
-  `loss_mask=0`.
-- Fresh model outputs from SGLang are appended with `loss_mask=1`.
-- If a later prompt no longer token-matches an earlier sampled output, the
-  unmatched suffix is dropped. If the drift cuts through the middle of a
-  previous model output, the retained prefix of that whole output turn is also
-  assigned `loss_mask=0`.
+- **clean** — no divergence. The new prompt suffix is tool/user/environment
+  context and is appended with `loss_mask=0`; the turn's own sampled output is
+  appended with `loss_mask=1`.
+- **realign** — a short divergence inside the most recent response span. That
+  whole span is overwritten from the incoming prompt as `loss_mask=0` and
+  accumulation continues, so the branch stays contiguous without training on
+  tokens whose provenance is now in doubt.
+- **fork** — divergence too large, or too early, to absorb. The current
+  `Sample` is closed and a fresh one opened at that boundary. The abandoned
+  turns are not discarded: they form their own `Sample` and still train.
 
-That last case is the important correctness guard. A re-tokenization mismatch
+That middle case is the important correctness guard. A re-tokenization mismatch
 can make a string-level conversation look continuous while token-level
 provenance is broken. slime keeps the context needed to continue the agent, but
 does not backprop through tokens whose sampled origin can no longer be proven.
+
+Two consequences worth stating explicitly, because they are easy to guess wrong:
+
+- One leaf chain yields *zero or more* `Sample`s, not exactly one: every fork
+  inside the chain starts another, and a `Sample` with no trained tokens is
+  dropped.
+- Each sampled response trains exactly once. A generated turn shared by sibling
+  leaves is trained on the first leaf to claim it; later leaves re-emit it as
+  `loss_mask=0` context so the shared prefix is not counted twice.
+
 The unit tests in `tests/test_agent/test_trajectory_manager_branching.py` cover matched
 prefixes, skipped turns, split-output drift, changed token counts, and
 prompt-base restarts.
 
 ## Fan-out Semantics
 
-- `generate()` returns `list[Sample]` — one Sample per root-to-leaf chain in the per-session message tree.
-- Per-trajectory reward is split as `reward / K` across chains; `rollout_id` is shared so the per-rollout-mean loss reducer still counts the trajectory once.
-- Sub-agent dispatch and auto-compaction increase `K` (each prompt-prefix divergence forks a new branch), so the effective batch after flatten can be much larger than `rollout_batch_size * n_samples_per_prompt`.
+- `generate()` returns `list[Sample]` — one or more per root-to-leaf chain in the per-session message tree.
+- The trajectory's outcome reward is assigned **in full to every emitted Sample**, not split across them, so each trained turn carries the trajectory's outcome. `rollout_id` is shared across siblings, so the per-rollout-mean loss reducer still counts the trajectory once regardless of how many Samples it produced.
+- Sub-agent dispatch, auto-compaction and token-drift forks all increase the Sample count per trajectory, so the effective batch after flatten can be much larger than `rollout_batch_size * n_samples_per_prompt`.
 - The per-prompt Sample count is therefore uneven. GRPO's reward normalization handles that: `_post_process_rewards` groups by `Sample.group_index` (the data source's per-prompt counter), not by reshaping the flat batch to `n_samples_per_prompt`, so each prompt is still centered against itself.
+
+Every emitted `Sample` carries three flags in `metadata`, derived from the chain
+it came from: `truncated` (the last generated turn stopped on
+`finish_reason="length"`), `use_tool` (some turn emitted `tool_calls`), and
+`ill_formed` (some turn's output failed tool/reasoning parsing). They are for
+filtering and diagnosis; nothing in the training path branches on them.
 
 ## Porting to a New Sandbox Backend
 
