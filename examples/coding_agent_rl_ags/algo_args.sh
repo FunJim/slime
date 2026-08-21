@@ -1,6 +1,7 @@
 # Algorithm arguments for the AGS coding-agent runs -- SOURCED, not executed.
 #
 #   ADVANTAGE_ESTIMATOR=grpo (default)  group-relative baseline, no critic.
+#   ADVANTAGE_ESTIMATOR=gspo            same baseline, sequence-level IS ratio.
 #   ADVANTAGE_ESTIMATOR=ppo             token-level GAE against a learned critic.
 #
 # Sourced by run_cc_*_{2,4}nodes.sh after SCRIPT_DIR, RUN_ROOT, SAVE_DIR,
@@ -14,22 +15,74 @@
 
 ADVANTAGE_ESTIMATOR="${ADVANTAGE_ESTIMATOR:-grpo}"
 
-# Shared by both estimators. The clip range is asymmetric (clip-higher, DAPO
-# arXiv:2503.14476): the upper bound is loosened so low-probability tokens can
-# still gain mass, which matters for agent trajectories where the useful tokens
-# (tool calls) are rare relative to prose.
+# ---- clip range --------------------------------------------------------
+# grpo/ppo clip a *per-token* ratio exp(log pi - log pi_old), which sits near 1
+# with O(1) spread, so the usual 0.2-scale bounds apply. The range is asymmetric
+# (clip-higher, DAPO arXiv:2503.14476): the upper bound is loosened so
+# low-probability tokens can still gain mass, which matters for agent
+# trajectories where the useful tokens (tool calls) are rare relative to prose.
+#
+# GSPO clips a *sequence-level* ratio -- the length-normalized geometric mean of
+# the token ratios (compute_gspo_kl in slime/utils/ppo_utils.py averages
+# old-minus-new over the loss mask, then broadcasts it back to every token). By
+# averaging, that quantity concentrates around 1 far more tightly than any
+# single token ratio does, so a 0.2 bound would essentially never bind and GSPO
+# would degenerate to unclipped policy gradient. The paper's scale is ~1e-4;
+# 3e-4/4e-4 matches arXiv:2507.18071 and the repo's own MoE launchers
+# (scripts/run-qwen3-235B-A22B.sh, scripts/run-qwen3-next-80B-A3B.sh).
+case "${ADVANTAGE_ESTIMATOR}" in
+gspo)
+   EPS_CLIP="${EPS_CLIP:-3e-4}"
+   EPS_CLIP_HIGH="${EPS_CLIP_HIGH:-4e-4}"
+   ;;
+*)
+   EPS_CLIP="${EPS_CLIP:-0.2}"
+   EPS_CLIP_HIGH="${EPS_CLIP_HIGH:-0.28}"
+   ;;
+esac
+
+# Shared by all estimators.
 ALGO_ARGS=(
    --advantage-estimator "${ADVANTAGE_ESTIMATOR}"
    --kl-loss-coef 0.00
    --kl-loss-type low_var_kl
    --kl-coef 0.00
    --entropy-coef 0.00
-   --eps-clip 0.2
-   --eps-clip-high 0.28
+   --eps-clip "${EPS_CLIP}"
+   --eps-clip-high "${EPS_CLIP_HIGH}"
 )
 
 case "${ADVANTAGE_ESTIMATOR}" in
 grpo) ;;
+gspo)
+   # ---- why GSPO here -----------------------------------------------------
+   # The advantage is computed exactly as for GRPO (loss.py groups grpo/gspo/
+   # cispo on the same group-relative baseline); what changes is the importance
+   # ratio the clipped objective is built from. GSPO scores the whole sequence
+   # with one ratio instead of scoring every token with its own, which is the
+   # right unit for two properties of this run:
+   #
+   #   * The model is MoE (Qwen3.5-35B-A3B). Between rollout and train the
+   #     router can send a token to different experts, so its per-token ratio
+   #     jumps for a reason that has nothing to do with the policy update. A
+   #     sequence-level ratio averages those router flips out; this is the
+   #     failure GSPO was introduced to fix.
+   #   * Reward is a single terminal bit per trajectory. A per-token ratio
+   #     pretends each token has its own credit; the sequence-level one matches
+   #     the granularity at which the reward was actually assigned.
+   #
+   # What GSPO does NOT fix: the group-collapse problem that motivated the PPO
+   # arm below. An AGS rollout still fans out into up to 8 samples sharing a
+   # rollout_id, and an all-solved or all-failed group still yields exactly zero
+   # advantage under either GRPO or GSPO. Run this arm for the MoE/off-policy
+   # mismatch, not for the zero-advantage rate.
+   #
+   # Cost: slime disables the log-prob reuse fast path under GSPO
+   # (can_reuse_log_probs_in_loss in megatron_utils/actor.py excludes it), so
+   # every train step pays an extra old-log-prob forward over the batch --
+   # cheaper than PPO's second full model, but not free.
+   echo "GSPO: sequence-level ratio, eps_clip=${EPS_CLIP} eps_clip_high=${EPS_CLIP_HIGH}"
+   ;;
 ppo)
    # ---- why PPO here ------------------------------------------------------
    # One AGS rollout fans out into up to 8 training samples that share a
@@ -185,7 +238,7 @@ ppo)
    echo "PPO: megatron role config -> ${MEGATRON_CONFIG_PATH}"
    ;;
 *)
-   echo "ERROR: unsupported ADVANTAGE_ESTIMATOR=${ADVANTAGE_ESTIMATOR} (expected grpo or ppo)" >&2
+   echo "ERROR: unsupported ADVANTAGE_ESTIMATOR=${ADVANTAGE_ESTIMATOR} (expected grpo, gspo or ppo)" >&2
    exit 1
    ;;
 esac

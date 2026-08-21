@@ -323,8 +323,9 @@ PERF_ARGS=(
    --use-dynamic-batch-size
 )
 
-# Sets ALGO_ARGS from ADVANTAGE_ESTIMATOR (grpo by default, ppo adds a critic
-# and writes a Megatron role-config YAML into RUN_ROOT). Shared with the 4-node
+# Sets ALGO_ARGS from ADVANTAGE_ESTIMATOR (grpo by default; gspo swaps in the
+# sequence-level ratio and a much tighter clip range; ppo adds a critic and
+# writes a Megatron role-config YAML into RUN_ROOT). Shared with the 2-node
 # launcher; see algo_args.sh for the PPO knobs.
 source "${SCRIPT_DIR}/algo_args.sh"
 
