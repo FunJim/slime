@@ -60,7 +60,7 @@ N_SAMPLES_PER_EVAL_PROMPT="${N_SAMPLES_PER_EVAL_PROMPT:-1}"
 # ============ paths — override before launching ============
 HF_CHECKPOINT="${HF_CHECKPOINT:-/data_train/ericxjzheng/models/Qwen3.5-35B-A3B}"
 REF_MODEL_PATH="${REF_MODEL_PATH:-/data_train/ericxjzheng/models/Qwen3.5-35B-A3B_torch_dist}"
-PROMPT_DATA="${PROMPT_DATA:-/data_train/ericxjzheng/data/SWE-rebench-filtered/filtered.jsonl}"
+PROMPT_DATA="${PROMPT_DATA:-/data_train/ericxjzheng/data/SWE-rebench-filtered/filtered_scan_base_n2.jsonl}"
 
 EXP_TAG="${EXP_TAG:-coding_agent_rl_ags_cc_qwen35_35b_a3b_4nodes}"
 STAMP="$(date +%Y%m%d_%H%M%S)"
@@ -288,15 +288,10 @@ PERF_ARGS=(
    --use-dynamic-batch-size
 )
 
-ALGO_ARGS=(
-   --advantage-estimator grpo
-   --kl-loss-coef 0.00
-   --kl-loss-type low_var_kl
-   --kl-coef 0.00
-   --entropy-coef 0.00
-   --eps-clip 0.2
-   --eps-clip-high 0.28
-)
+# Sets ALGO_ARGS from ADVANTAGE_ESTIMATOR (grpo by default, ppo adds a critic
+# and writes a Megatron role-config YAML into RUN_ROOT). Shared with the 4-node
+# launcher; see algo_args.sh for the PPO knobs.
+source "${SCRIPT_DIR}/algo_args.sh"
 
 OPTIMIZER_ARGS=(
    --optimizer adam
