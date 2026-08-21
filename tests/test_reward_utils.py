@@ -113,6 +113,118 @@ def test_length_mismatch_is_rejected():
 
 
 # ---------------------------------------------------------------------------
+# Attempt-level baseline. An agentic rollout splits one attempt into several
+# samples sharing a rollout_id, and the loss already collapses those into a
+# single per-attempt mean (measured: total weight 1.0 per attempt regardless of
+# segment count). The baseline has to use the same unit, or a heavily-forked
+# attempt votes several times in its own group's mean.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_segment_count_does_not_move_the_baseline():
+    # Same 8 attempts, 5 solved. Forking one of them must not shift the mean.
+    unforked = normalize_rewards_by_group(
+        [1.0] * 5 + [0.0] * 3,
+        [0] * 8,
+        list(range(8)),
+        normalize_std=False,
+    )
+    # Attempt 5 (a failure) now arrives as three segments.
+    forked = normalize_rewards_by_group(
+        [1.0] * 5 + [0.0, 0.0, 0.0] + [0.0, 0.0],
+        [0] * 10,
+        [0, 1, 2, 3, 4, 5, 5, 5, 6, 7],
+        normalize_std=False,
+    )
+
+    # Solved attempts keep the same advantage either way: 1 - 5/8.
+    assert forked[0] == pytest.approx(unforked[0])
+    assert forked[0] == pytest.approx(0.375)
+    # Counting samples instead would give 1 - 5/10 = 0.5.
+    assert forked[0] != pytest.approx(0.5)
+
+
+@pytest.mark.unit
+def test_segments_of_one_attempt_share_its_advantage():
+    normalized = normalize_rewards_by_group(
+        [1.0, 1.0, 1.0, 0.0],
+        [0] * 4,
+        ["a", "a", "a", "b"],
+        normalize_std=True,
+    )
+
+    assert normalized[0] == pytest.approx(normalized[1]) == pytest.approx(normalized[2])
+    assert normalized[3] < 0.0 < normalized[0]
+
+
+@pytest.mark.unit
+def test_a_single_attempt_split_into_segments_has_no_signal():
+    # One attempt cannot be compared against anything, however many segments it
+    # produced. Centering alone must send every segment to 0, with no NaN from
+    # a one-element std.
+    normalized = normalize_rewards_by_group([1.0] * 4, [0] * 4, ["a"] * 4, normalize_std=True)
+
+    assert normalized == pytest.approx([0.0] * 4)
+
+
+@pytest.mark.unit
+def test_disagreeing_segments_reduce_deterministically():
+    # Segments of one attempt should carry the same reward; if a custom path
+    # breaks that, the reduction must not depend on sample order.
+    forward = normalize_rewards_by_group([1.0, 0.0, 0.0], [0] * 3, ["a", "a", "b"], normalize_std=False)
+    reverse = normalize_rewards_by_group([0.0, 1.0, 0.0], [0] * 3, ["a", "a", "b"], normalize_std=False)
+
+    assert forward[2] == pytest.approx(reverse[2])
+    # "solved if any segment solved": attempt a counts as 1.0, so mean is 0.5.
+    assert forward[2] == pytest.approx(-0.5)
+
+
+@pytest.mark.unit
+def test_rollout_ids_are_scoped_to_their_prompt_group():
+    # Two prompts, each with attempts numbered from scratch. Grouping happens
+    # first, so identical ids in different groups must not merge.
+    normalized = normalize_rewards_by_group(
+        [1.0, 0.0, 0.0, 1.0],
+        [0, 0, 1, 1],
+        [0, 1, 0, 1],
+        normalize_std=False,
+    )
+
+    assert normalized == pytest.approx([0.5, -0.5, -0.5, 0.5])
+
+
+@pytest.mark.unit
+def test_omitting_rollout_ids_matches_passing_distinct_ones():
+    rewards = [1.0, 0.0, 0.5, 1.0]
+    groups = [0, 0, 0, 0]
+
+    assert normalize_rewards_by_group(rewards, groups, normalize_std=True) == pytest.approx(
+        normalize_rewards_by_group(rewards, groups, list(range(4)), normalize_std=True)
+    )
+
+
+@pytest.mark.unit
+def test_a_none_rollout_id_is_its_own_attempt():
+    # The default path leaves rollout_id unset; a mixed batch must not merge the
+    # unset ones into a single bucket.
+    normalized = normalize_rewards_by_group(
+        [1.0, 0.0, 0.0, 0.0],
+        [0] * 4,
+        [None, None, None, None],
+        normalize_std=False,
+    )
+
+    assert normalized == pytest.approx([0.75, -0.25, -0.25, -0.25])
+
+
+@pytest.mark.unit
+def test_rollout_ids_length_is_validated():
+    with pytest.raises(ValueError, match="rollout_ids must have the same length"):
+        normalize_rewards_by_group([1.0, 2.0], [0, 0], [0], normalize_std=False)
+
+
+# ---------------------------------------------------------------------------
 # Call-site guard. The bug lived in RolloutManager._post_process_rewards, not in
 # the function above, so the function passing its own tests is not enough -- a
 # revert of the call site would leave every test here green. Asserted against
@@ -136,8 +248,10 @@ def test_rollout_manager_normalizes_through_this_function():
 def test_rollout_manager_passes_per_prompt_group_identity():
     source = ROLLOUT_SOURCE.read_text()
 
-    # Grouping must come from the samples, not from the batch shape.
+    # Grouping must come from the samples, not from the batch shape, and the
+    # baseline must be reduced to one entry per attempt.
     assert "[sample.group_index for sample in samples]" in source
+    assert "[sample.rollout_id for sample in samples]" in source
     assert "fallback_group_size=self.args.n_samples_per_prompt" in source
 
 

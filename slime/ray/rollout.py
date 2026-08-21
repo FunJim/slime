@@ -713,6 +713,7 @@ class RolloutManager:
             rewards = normalize_rewards_by_group(
                 raw_rewards,
                 [sample.group_index for sample in samples],
+                [sample.rollout_id for sample in samples],
                 normalize_std=normalize_std,
                 fallback_group_size=self.args.n_samples_per_prompt,
             )
