@@ -80,8 +80,35 @@ gspo)
    # Cost: slime disables the log-prob reuse fast path under GSPO
    # (can_reuse_log_probs_in_loss in megatron_utils/actor.py excludes it), so
    # every train step pays an extra old-log-prob forward over the batch --
-   # cheaper than PPO's second full model, but not free.
-   echo "GSPO: sequence-level ratio, eps_clip=${EPS_CLIP} eps_clip_high=${EPS_CLIP_HIGH}"
+   # cheaper than PPO's second full model, but not free. Note the fast path also
+   # requires a single global batch, so at nspr>1 GRPO pays it too.
+   echo "GSPO: sequence-level ratio, eps_clip=${EPS_CLIP} eps_clip_high=${EPS_CLIP_HIGH}" \
+        "num_steps_per_rollout=${NUM_STEPS_PER_ROLLOUT}"
+
+   # The one configuration in which this whole branch is a no-op. train_actor
+   # computes old_log_probs once per rollout, so with a single optimizer step the
+   # ratio is identically 1: measured train/ppo_kl = 0.0 and train/pg_clipfrac =
+   # 0.0 exactly, on every step of a run that used nspr=1. The clip range above
+   # never binds and the objective is GRPO's. run_gspo_*.sh defaults to 3; this
+   # warns for anyone who sets ADVANTAGE_ESTIMATOR=gspo against the CC launcher
+   # directly, or overrides the wrapper back to 1.
+   if (( NUM_STEPS_PER_ROLLOUT == 1 )); then
+      echo "WARNING: NUM_STEPS_PER_ROLLOUT=1 makes GSPO mathematically identical to GRPO --" \
+           "old_log_probs are computed once per rollout, so the single step is on-policy," \
+           "the importance ratio is 1 and eps-clip (${EPS_CLIP}/${EPS_CLIP_HIGH}) never binds." \
+           "Use NUM_STEPS_PER_ROLLOUT>=2 (3 is the measured recommendation) for GSPO to differ." >&2
+   fi
+
+   # The recommended nspr=3 only pays off if the batch divides. gbs is a floor
+   # division and build_dp_schedule then drops the trailing remainder with no log
+   # line, so an inexact override silently throws away whole agent trajectories.
+   _GSPO_TOTAL=$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT))
+   if (( _GSPO_TOTAL % NUM_STEPS_PER_ROLLOUT != 0 )); then
+      echo "WARNING: rollout_batch_size * n_samples_per_prompt (${_GSPO_TOTAL}) is not divisible by" \
+           "NUM_STEPS_PER_ROLLOUT (${NUM_STEPS_PER_ROLLOUT}); build_dp_schedule will silently drop" \
+           "$((_GSPO_TOTAL - (_GSPO_TOTAL / NUM_STEPS_PER_ROLLOUT) * NUM_STEPS_PER_ROLLOUT))" \
+           "sample(s) per rollout. Pick a rollout_batch_size that divides." >&2
+   fi
    ;;
 ppo)
    # ---- why PPO here ------------------------------------------------------

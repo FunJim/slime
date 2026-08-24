@@ -43,7 +43,12 @@ NUM_ROLLOUT="${NUM_ROLLOUT:-100}"
 ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"
 N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-8}"
 NUM_STEPS_PER_ROLLOUT="${NUM_STEPS_PER_ROLLOUT:-1}"
-GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT))}"
+# Divided by NUM_STEPS_PER_ROLLOUT because slime derives gbs the same way and
+# asserts an explicitly passed --global-batch-size matches
+# (rollout_batch_size * n_samples_per_prompt // num_steps_per_rollout). At the
+# default nspr=1 this is the same value as before; at nspr>1 the undivided form
+# aborted at startup on that assert.
+GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT / NUM_STEPS_PER_ROLLOUT))}"
 MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-1}"
 
 # ============ context length ============
