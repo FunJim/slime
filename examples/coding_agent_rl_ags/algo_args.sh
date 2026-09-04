@@ -62,8 +62,9 @@ ppo)
    # in slime/backends/megatron_utils/model.py), so its first predictions are
    # noise. Train the critic alone for the first few rollouts; the actor is
    # frozen until then, and its weights are still pushed to the rollout engines
-   # so generation is unaffected.
-   NUM_CRITIC_ONLY_STEPS="${NUM_CRITIC_ONLY_STEPS:-2}"
+   # so generation is unaffected. One step is enough in practice: across three
+   # cold starts value_loss fell below 1 within five steps.
+   NUM_CRITIC_ONLY_STEPS="${NUM_CRITIC_ONLY_STEPS:-1}"
 
    # Critic LR is ~10x the actor's: it is fitting a scalar regression head from
    # scratch while the actor only needs small policy nudges.
@@ -96,6 +97,15 @@ ppo)
       CRITIC_COLD_START=1
    fi
 
+   # Does the ACTOR have a checkpoint to resume from? Needed below for two
+   # decisions that depend on the actor and critic disagreeing.
+   ACTOR_LOAD_DIR="${LOAD_DIR:-${SAVE_DIR}}"
+   if [[ -f "${ACTOR_LOAD_DIR}/latest_checkpointed_iteration.txt" ]]; then
+      ACTOR_RESUMING=1
+   else
+      ACTOR_RESUMING=0
+   fi
+
    MEGATRON_CONFIG_PATH="${MEGATRON_CONFIG_PATH:-${RUN_ROOT}/megatron_ppo.yaml}"
    mkdir -p "$(dirname -- "${MEGATRON_CONFIG_PATH}")"
    # Keys are argparse attribute names (underscores), not CLI flags. Only
@@ -120,8 +130,38 @@ ppo)
          echo "      finetune: true"
          echo "      no_load_optim: true"
          echo "      no_load_rng: true"
+      else
+         # Written out rather than inherited. The critic overrides are applied
+         # on top of the args as slime_validate_args left them, and that
+         # function sets finetune/no_load_optim/no_load_rng to true whenever the
+         # ACTOR has no checkpoint (slime/utils/arguments.py:1799). Inheriting
+         # in that case would load the critic's weights while discarding its
+         # Adam moments, its RNG state, and its LR schedule position -- the
+         # silent degradation this block exists to prevent.
+         echo "      finetune: false"
+         echo "      no_load_optim: false"
+         echo "      no_load_rng: false"
       fi
    } >"${MEGATRON_CONFIG_PATH}"
+
+   # slime takes the run's starting rollout from the CRITIC when a critic exists
+   # (slime/ray/placement_group.py:211, whose own TODO says the user must pin it),
+   # and Megatron forces iteration=0 whenever finetune is set
+   # (checkpointing.py:1731). So a cold-starting critic reports rollout 1 even
+   # when the actor is resuming from rollout 50: the run would restart from 1
+   # with rollout-50 actor weights, and rollout_manager.load(0) would rewind the
+   # dataset too -- silently re-training data already consumed. Pin the id to the
+   # actor's own resume point instead.
+   if (( CRITIC_COLD_START && ACTOR_RESUMING )); then
+      ACTOR_ITER="$(cat "${ACTOR_LOAD_DIR}/latest_checkpointed_iteration.txt")"
+      START_ROLLOUT_ID="${START_ROLLOUT_ID:-$((ACTOR_ITER + 1))}"
+      ALGO_ARGS+=(--start-rollout-id "${START_ROLLOUT_ID}")
+      echo "PPO: critic is cold-starting while the actor resumes from iteration ${ACTOR_ITER};" \
+           "pinning --start-rollout-id ${START_ROLLOUT_ID} so the critic's zeroed iteration" \
+           "does not rewind the run to rollout 1."
+   elif [[ -n "${START_ROLLOUT_ID:-}" ]]; then
+      ALGO_ARGS+=(--start-rollout-id "${START_ROLLOUT_ID}")
+   fi
 
    ALGO_ARGS+=(
       --gamma "${PPO_GAMMA}"
