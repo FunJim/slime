@@ -18,6 +18,7 @@ from slime.backends.sglang_utils.external import start_external_rollout_servers
 from slime.backends.sglang_utils.sglang_config import ModelConfig, ServerGroupConfig, SglangConfig
 from slime.backends.sglang_utils.sglang_engine import SGLangEngine
 from slime.rollout.base_types import call_rollout_fn
+from slime.rollout.reward_utils import normalize_rewards_by_group
 from slime.utils import logging_utils
 from slime.utils.data import get_source
 from slime.utils.dp_schedule import build_dp_schedule
@@ -694,21 +695,29 @@ class RolloutManager:
             self.args.advantage_estimator in ["grpo", "gspo", "cispo", "reinforce_plus_plus_baseline"]
             and self.args.rewards_normalization
         ):
-            # group norm
-            rewards = torch.tensor(raw_rewards, dtype=torch.float)
-            if rewards.shape[-1] == self.args.n_samples_per_prompt * self.args.rollout_batch_size:
-                rewards = rewards.reshape(-1, self.args.n_samples_per_prompt)
-            else:
-                # when samples count are not equal in each group
-                rewards = rewards.view(-1, rewards.shape[-1])
-            mean = rewards.mean(dim=-1, keepdim=True)
-            rewards = rewards - mean
-
-            if self.args.advantage_estimator in ["grpo", "gspo", "cispo"] and self.args.grpo_std_normalization:
-                std = rewards.std(dim=-1, keepdim=True)
-                rewards = rewards / (std + 1e-6)
-
-            return raw_rewards, rewards.flatten().tolist()
+            # Group norm, one group per prompt. Grouping is by group_index rather
+            # than by reshaping to (-1, n_samples_per_prompt): a rollout function
+            # that fans one trajectory out to several training samples (sub-agent
+            # dispatch, auto-compaction, token-drift forks) makes the per-prompt
+            # count uneven, so the total no longer equals
+            # n_samples_per_prompt * rollout_batch_size and a reshape cannot
+            # express the grouping at all. The previous fallback for that case
+            # normalized over the whole batch as ONE group, which silently
+            # replaced per-prompt centering with batch-wide centering: measured on
+            # agent-fanout dumps, 80% of advantages came out with the wrong sign
+            # and prompts that solved nothing picked up non-zero advantages from
+            # other prompts in the batch.
+            normalize_std = (
+                self.args.advantage_estimator in ["grpo", "gspo", "cispo"] and self.args.grpo_std_normalization
+            )
+            rewards = normalize_rewards_by_group(
+                raw_rewards,
+                [sample.group_index for sample in samples],
+                [sample.rollout_id for sample in samples],
+                normalize_std=normalize_std,
+                fallback_group_size=self.args.n_samples_per_prompt,
+            )
+            return raw_rewards, rewards
 
         return raw_rewards, raw_rewards
 
@@ -744,6 +753,12 @@ class RolloutManager:
             "truncated": [1 if sample.status == Sample.Status.TRUNCATED else 0 for sample in samples],
             "sample_indices": [sample.index for sample in samples],
             "rollout_ids": rollout_ids,
+            # Deliberately NOT routed through normalize_rewards_by_group's grouping:
+            # that one rejects a partially-missing group_index, which is right for
+            # rewards (a wrong baseline corrupts training) but wrong here. This
+            # feeds pass-rate logging only, so a batch mixing samples with and
+            # without group_index should degrade to positional grouping rather
+            # than crash the run over a metric.
             "raw_reward_group_indices": [
                 sample.group_index if sample.group_index is not None else i // self.args.n_samples_per_prompt
                 for i, sample in enumerate(samples)

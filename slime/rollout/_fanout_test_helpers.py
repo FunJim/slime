@@ -14,16 +14,13 @@ Two helpers:
     framework (per-rollout step splitter, per-rollout-mean reducer,
     ``_validate_rollout_id_annotated`` validator) is built around.
 
-  - ``grpo_normalize_by_group_index``: replaces the default
-    ``_post_process_rewards`` reshape-by-shape logic with a proper
-    ``group_index``-keyed grouping. The default at
-    ``slime/ray/rollout.py:618`` assumes every prompt produced exactly
-    ``n_samples_per_prompt`` samples and reshapes by that constant; when
-    compact/fanout makes the per-prompt count uneven, the reshape fails
-    and the fallback ``view(-1, total)`` collapses everything into ONE
-    group, destroying per-prompt centering. ``group_index`` (set by the
-    data source per-prompt, preserved through ``deepcopy``) is the right
-    key here.
+  - ``grpo_normalize_by_group_index``: per-prompt GRPO reward
+    normalization, still wired into the e2e test above via
+    ``--custom-reward-post-process-path``. It is now redundant with the
+    default (see ``slime/rollout/reward_utils.py``), but is kept both
+    because users may have the flag pointed at it and because it gives
+    the normalization tests an oracle that is not the implementation
+    under test.
 """
 
 import copy
@@ -66,28 +63,29 @@ async def compact_generate(args, sample, sampling_params):
         # Critical invariant: all siblings share ``rollout_id`` so the
         # per-rollout reducer aggregates them as ONE rollout (not N) and
         # the rollout-aware step splitter keeps them in the same step.
-        # ``group_index`` is inherited via ``deepcopy`` and is what the
-        # post-process reward hook below groups on for GRPO normalize.
+        # ``group_index`` is inherited via ``deepcopy`` so production reward
+        # normalization keeps the siblings in their prompt group.
         s.rollout_id = sample.index
         siblings.append(s)
     return siblings
 
 
 def grpo_normalize_by_group_index(args, samples):
-    """Drop-in ``--custom-reward-post-process-path`` for compact/fanout.
+    """Reference implementation of per-prompt GRPO reward normalization.
 
-    The default ``_post_process_rewards`` (``slime/ray/rollout.py:618``)
-    reshapes the flat reward tensor as ``(-1, n_samples_per_prompt)``
-    when ``total == n_samples_per_prompt * rollout_batch_size``, falling
-    back to ``view(-1, total)`` (= one giant group) otherwise. With
-    fanout the count per prompt is uneven, so the fallback fires and
-    centering is computed across ALL samples in the batch instead of
-    per-prompt — that's silently wrong for GRPO.
+    Equivalent to what the default ``_post_process_rewards`` now does via
+    ``slime.rollout.reward_utils.normalize_rewards_by_group``: group by
+    ``Sample.group_index`` -- the data-source-set per-prompt counter, preserved
+    through the deepcopy in ``compact_generate`` -- then mean-center and
+    optionally std-normalize within each group.
 
-    This helper groups by ``Sample.group_index`` (the data-source-set
-    per-prompt counter, preserved through deepcopy in
-    ``compact_generate``) and applies the same mean-center + optional
-    std-normalize the default does, just with the correct grouping.
+    Written as a ``--custom-reward-post-process-path`` workaround back when the
+    default built its groups by reshaping to ``(-1, n_samples_per_prompt)`` and
+    fell back to one batch-wide group whenever fan-out made the per-prompt count
+    uneven. That fallback is gone, so this is no longer load-bearing, but it is
+    kept: the e2e fan-out test still passes the flag, users may have it
+    configured too, and duplicating the logic gives the normalization tests an
+    oracle that is not the implementation under test.
 
     Returns ``(raw_rewards, normalized_rewards)`` matching the input
     ``samples`` order — same shape as the default's return contract.
