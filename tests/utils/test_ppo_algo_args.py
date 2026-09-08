@@ -244,7 +244,11 @@ class TestPPOAlgoArgs:
             SAVE_DIR=str(exp / "checkpoints"),
             REF_MODEL_PATH=str(tmp_path / "ref"),
             NUM_ROLLOUT="20",
-            ADVANTAGE_ESTIMATOR="gspo",
+            # Was "gspo" when this test was written, before the gspo branch
+            # existed. Any name the case statement does not handle will do; the
+            # property under test is that an unknown estimator stops the
+            # launcher instead of silently training with default arguments.
+            ADVANTAGE_ESTIMATOR="not_an_estimator",
         )
         result = subprocess.run(
             ["bash", "-c", f'set -e; source "{ALGO_ARGS}"; echo REACHED_CALLER'],
