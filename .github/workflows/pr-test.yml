@@ -567,6 +567,10 @@ jobs:
             },
             {
               "num_gpus": 0,
+              "test_file": "utils/test_ppo_algo_args.py"
+            },
+            {
+              "num_gpus": 0,
               "test_file": "test_dp_schedule.py"
             },
             {

@@ -545,7 +545,7 @@ print(json.dumps({"env_vars": env}))
 PY
 )
 
-ray job submit --address="http://127.0.0.1:8265" \
+ray job submit --address="http://127.0.0.1:${RAY_DASHBOARD_PORT}" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 -u train.py \
    --actor-num-nodes "${ACTOR_NUM_NODES}" \
