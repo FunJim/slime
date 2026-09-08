@@ -60,7 +60,7 @@ N_SAMPLES_PER_EVAL_PROMPT="${N_SAMPLES_PER_EVAL_PROMPT:-1}"
 # ============ paths — override before launching ============
 HF_CHECKPOINT="${HF_CHECKPOINT:-/data_train/ericxjzheng/models/Qwen3.5-35B-A3B}"
 REF_MODEL_PATH="${REF_MODEL_PATH:-/data_train/ericxjzheng/models/Qwen3.5-35B-A3B_torch_dist}"
-PROMPT_DATA="${PROMPT_DATA:-/data_train/ericxjzheng/data/SWE-rebench-filtered/filtered.jsonl}"
+PROMPT_DATA="${PROMPT_DATA:-/data_train/ericxjzheng/data/SWE-rebench-filtered/filtered_scan_base_n2.jsonl}"
 
 EXP_TAG="${EXP_TAG:-coding_agent_rl_ags_cc_qwen35_35b_a3b_2nodes}"
 STAMP="$(date +%Y%m%d_%H%M%S)"
@@ -85,9 +85,31 @@ export MASTER_ADDR="${MASTER_ADDR:-${MLP_WORKER_0_HOST:-$(hostname -I | awk '{pr
 export MASTER_PORT="${MASTER_PORT:-${MLP_WORKER_0_PORT:-6379}}"
 export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-${MLP_SOCKET_IFNAME:-eth0}}"
 export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-${MLP_SOCKET_IFNAME:-eth0}}"
+# eth0 on these nodes carries both IPv4 and a link-local IPv6, and gloo picks an
+# address family per rank independently -- ranks then disagree and die with
+# "ss1.ss_family == ss2.ss_family. 10 vs 2". It is a race, so a single clean smoke
+# does not prove it is absent; pin the family instead.
+export GLOO_SOCKET_FAMILY="${GLOO_SOCKET_FAMILY:-AF_INET}"
+
+# One knob for both sides of the rollout buffer: buffer.py binds
+# int(ROLLOUT_BUFFER_PORT or 8889) and the trainer reaches it through
+# --rollout-buffer-url. Overriding only one of the two is the failure this prevents.
+# Set here, not next to the buffer launch further down, because ROLLOUT_ARGS
+# interpolates it and is built first.
+export ROLLOUT_BUFFER_PORT="${ROLLOUT_BUFFER_PORT:-8889}"
 
 # ============ SWE / Claude Code / AGS rollout knobs ============
 export SWE_AGENT="${SWE_AGENT:-claude_code}"
+
+# Turn off Weave trace tracking. weave.init() reads WEAVE_DISABLED itself
+# (weave.trace.settings.should_disable_weave) and returns a client whose
+# create_call yields a NoOpCall, so AGSWeaveTrace keeps calling the same API and
+# nothing is uploaded -- verified in the container on weave 0.53.4. This is the
+# right switch rather than unsetting --use-wandb, because _wandb_project() in
+# weave_trace.py derives the Weave project from the wandb args: killing wandb to
+# kill Weave would also cost us the training metrics this stress test is judged on.
+export WEAVE_DISABLED="${WEAVE_DISABLED:-1}"
+
 
 # AGS uses the E2B-compatible SDK surface. Export E2B_API_KEY in the launch
 # environment (for Tencent AGS this is typically the AGS gateway key).
@@ -217,6 +239,19 @@ SAVE_DIR="${SAVE_DIR:-${EXP}/checkpoints}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-5}"
 mkdir -p "${SAVE_DIR}"
 
+# --load defaults to SAVE_DIR, so a checkpoint left there by an earlier run makes
+# this one silently RESUME from it instead of starting from the HF weights, which
+# would quietly invalidate a stress test. There is no way to skip the final save
+# (a large --save-interval still saves on the last rollout because
+# should_run_periodic_action returns True at rollout_id == num_rollout - 1, and
+# omitting the flag trips a Megatron assert), so guard the input side instead.
+if [[ -z "${LOAD_DIR:-}" ]] && compgen -G "${SAVE_DIR}/iter_*" >/dev/null; then
+  echo "ERROR: ${SAVE_DIR} already holds iter_* checkpoint(s); this run would resume from them" \
+       "rather than from ${HF_CHECKPOINT}. Point SAVE_DIR at a fresh directory, or set LOAD_DIR" \
+       "explicitly to confirm the resume is intended." >&2
+  exit 1
+fi
+
 CKPT_ARGS=(
    --hf-checkpoint "${HF_CHECKPOINT}"
    --ref-load "${REF_MODEL_PATH}"
@@ -232,7 +267,7 @@ ROLLOUT_ARGS=(
    --custom-rollout-log-function-path slime_plugins.rollout_buffer.generator.ags_generator.wandb_metrics.log_rollout_data
    --custom-eval-rollout-log-function-path slime_plugins.rollout_buffer.generator.ags_generator.wandb_metrics.log_eval_rollout_data
    --rollout-task-type ags
-   --rollout-buffer-url "http://${MASTER_ADDR}:8889"
+   --rollout-buffer-url "http://${MASTER_ADDR}:${ROLLOUT_BUFFER_PORT}"
    --prompt-data "${PROMPT_DATA}"
    --input-key prompt
    --label-key label
@@ -288,19 +323,18 @@ PERF_ARGS=(
    --use-dynamic-batch-size
 )
 
-ALGO_ARGS=(
-   --advantage-estimator grpo
-   --kl-loss-coef 0.00
-   --kl-loss-type low_var_kl
-   --kl-coef 0.00
-   --entropy-coef 0.00
-   --eps-clip 0.2
-   --eps-clip-high 0.28
-)
+# Sets ALGO_ARGS from ADVANTAGE_ESTIMATOR (grpo by default, ppo adds a critic
+# and writes a Megatron role-config YAML into RUN_ROOT). Shared with the 4-node
+# launcher; see algo_args.sh for the PPO knobs.
+source "${SCRIPT_DIR}/algo_args.sh"
+
+# Actor lr is a knob so a run can vary it without editing this file; the critic lr
+# is separate and comes from the role-config YAML in algo_args.sh.
+ACTOR_LR="${ACTOR_LR:-1e-6}"
 
 OPTIMIZER_ARGS=(
    --optimizer adam
-   --lr 1e-6
+   --lr "${ACTOR_LR}"
    --lr-decay-style constant
    --weight-decay 0.1
    --adam-beta1 0.9
@@ -337,7 +371,13 @@ else
    WANDB_ARGS=()
 fi
 
+# Seed drives both the rollout data order (--rollout-shuffle) and the SGLang
+# engine sampling seeds, which is what a seed-repeat run needs to vary. Megatron
+# defaults it to 1234; keeping that default preserves existing behaviour.
+SEED="${SEED:-1234}"
+
 MISC_ARGS=(
+   --seed "${SEED}"
    --attention-dropout 0.0
    --hidden-dropout 0.0
    --accumulate-allreduce-grads-in-fp32
@@ -354,12 +394,42 @@ python3 -u -m slime_plugins.rollout_buffer.buffer >"${BUFFER_LOG_FILE}" 2>&1 &
 BUFFER_PID=$!
 trap 'kill ${BUFFER_PID} 2>/dev/null || true' EXIT
 sleep 5
+if ! kill -0 "${BUFFER_PID}" 2>/dev/null; then
+  echo "ERROR: rollout buffer died during startup; see ${BUFFER_LOG_FILE}" >&2
+  tail -30 "${BUFFER_LOG_FILE}" >&2 || true
+  exit 1
+fi
 
 # ============ bring up ray cluster ============
+# The worker loop below is a no-op inside the slime container: /root/mpi_rack_hostfile
+# does not exist there, and even with a hostfile the loop would ssh to the worker
+# HOST (--network host means port 22 is the host sshd), where ray is not installed;
+# the image also ships no root ssh key. Join workers by hand while this script
+# polls below:
+#   ssh <worker> "docker exec <container> bash -lc \
+#     'ray start --address=${MASTER_ADDR}:${MASTER_PORT} --num-gpus 8 \
+#      --node-ip-address <worker-ip> --disable-usage-stats'"
 HOSTFILE="${HOSTFILE:-/root/mpi_rack_hostfile}"
 
-ray start --head --node-ip-address "${MASTER_ADDR}" --num-gpus "${ACTOR_NUM_GPUS_PER_NODE}" \
-   --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
+# --port is explicit because ray start --head binds GCS to 6379 regardless of what
+# MASTER_PORT says, and workers dialing MASTER_ADDR:$MASTER_PORT would then hang on
+# "Failed to connect to GCS". The dashboard-agent ports are explicit because the
+# default 52365 is already held by another tenant on sh3-10 and sh3-15; when it is
+# taken the agent dies at startup but `ray status` still reports a healthy cluster
+# and only `ray job submit` fails, with "No available agent to submit job".
+RAY_DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-8265}"
+RAY_DASHBOARD_AGENT_PORT="${RAY_DASHBOARD_AGENT_PORT:-52465}"
+RAY_DASHBOARD_AGENT_GRPC_PORT="${RAY_DASHBOARD_AGENT_GRPC_PORT:-52466}"
+RAY_RUNTIME_ENV_AGENT_PORT="${RAY_RUNTIME_ENV_AGENT_PORT:-52467}"
+RAY_METRICS_EXPORT_PORT="${RAY_METRICS_EXPORT_PORT:-52468}"
+
+ray start --head --node-ip-address "${MASTER_ADDR}" --port "${MASTER_PORT}" \
+   --num-gpus "${ACTOR_NUM_GPUS_PER_NODE}" \
+   --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port="${RAY_DASHBOARD_PORT}" \
+   --dashboard-agent-listen-port "${RAY_DASHBOARD_AGENT_PORT}" \
+   --dashboard-agent-grpc-port "${RAY_DASHBOARD_AGENT_GRPC_PORT}" \
+   --runtime-env-agent-port "${RAY_RUNTIME_ENV_AGENT_PORT}" \
+   --metrics-export-port "${RAY_METRICS_EXPORT_PORT}"
 
 if [[ -f "${HOSTFILE}" ]]; then
   WORKER_LIMIT=$((ACTOR_NUM_NODES - 1))
@@ -389,7 +459,49 @@ else
 fi
 
 echo "Waiting for Ray cluster to stabilize..."
-sleep 30
+# A fixed sleep hides a late or missing worker: the job then hangs on "1+ pending
+# placement groups" while `ray status` shows a perfectly healthy cluster holding
+# only the head's 8 GPUs. Poll for the full GPU count instead, and fail loudly.
+#
+# `ray list nodes` (a state API query) rather than ray.init(address="auto"): the
+# latter would attach and tear down a fresh driver on every poll iteration. The same
+# query also answers the DEAD-node question below, so both checks read one source.
+# A worker that joined, was ray-stopped, and rejoined leaves a DEAD entry for the
+# same IP; `ray status` counts only live GPUs so it still looks right, but Ray can
+# place the job supervisor on the dead entry and the job then dies within a minute
+# with "Job supervisor actor died" on two perfectly healthy hosts.
+RAY_WAIT_SEC="${RAY_WAIT_SEC:-300}"
+_deadline=$((SECONDS + RAY_WAIT_SEC))
+while true; do
+  read -r _gpus _dead <<<"$(ray list nodes --format json --limit 1000 2>/dev/null | python3 -c '
+import json, sys
+try:
+    nodes = json.load(sys.stdin)
+except Exception:
+    print("0 0"); raise SystemExit
+alive = [n for n in nodes if n.get("state") == "ALIVE"]
+gpus = sum(int((n.get("resources_total") or {}).get("GPU", 0)) for n in alive)
+print(gpus, sum(1 for n in nodes if n.get("state") == "DEAD"))
+' 2>/dev/null || echo "0 0")"
+  _gpus=${_gpus:-0}; _dead=${_dead:-0}
+  if (( _dead > 0 )); then
+    echo "ERROR: ${_dead} DEAD node entry(ies) in the Ray cluster. Recover with: ray stop --force" \
+         "and rm -rf /tmp/ray/session_* on every node, then start the head and join each worker once." >&2
+    ray status || true
+    exit 1
+  fi
+  if (( _gpus >= TOTAL_NUM_GPUS )); then
+    echo "Ray cluster has ${_gpus}/${TOTAL_NUM_GPUS} GPUs registered across ALIVE nodes, 0 DEAD."
+    break
+  fi
+  if (( SECONDS >= _deadline )); then
+    echo "ERROR: only ${_gpus}/${TOTAL_NUM_GPUS} GPUs registered after ${RAY_WAIT_SEC}s." >&2
+    ray status || true
+    exit 1
+  fi
+  echo "  ${_gpus}/${TOTAL_NUM_GPUS} GPUs registered; waiting..."
+  sleep 10
+done
 ray status
 
 # ============ runtime env propagated to ray workers ============
@@ -406,6 +518,10 @@ keys = (
     "SWE_BOOT_CONCURRENCY",
     "SWE_BOOT_RETRIES", "SWE_ROLLOUT_GUARD_SEC", "SWE_ROLLOUT_CONCURRENCY",
     "SWE_EMPTY_PATCH_GUARD", "SWE_PROMPT_STYLE", "SWE_EVAL_PROMPT_STYLE",
+    # The AGS generator (and therefore AGSWeaveTrace/weave.init) runs inside the
+    # rollout-buffer and Ray worker processes, not this shell, so the disable flag
+    # has to travel with the runtime env or Weave would still initialize there.
+    "WEAVE_DISABLED",
     "SLIME_AGENT_CC_EXTRA_ARGS", "SLIME_AGENT_CC_EXTRA_ENVS",
     "SLIME_AGENT_CBC_EXTRA_ARGS", "SLIME_AGENT_CBC_EXTRA_ENVS",
     # Read by CodeBuddyCodeHarness.write_config to set models.json maxInputTokens,
@@ -416,7 +532,12 @@ keys = (
 env = {k: os.environ[k] for k in keys if k in os.environ}
 env["MASTER_ADDR"] = os.environ["MASTER_ADDR"]
 env["MASTER_PORT"] = os.environ.get("MASTER_PORT", "")
-# Keep per-node socket interface env inherited from each Ray node; do not override workers with the head ifname.
+# Workers joined by hand inherit nothing from this shell, so ship the ifname and
+# the pinned address family in the runtime env. All nodes here use eth0, so there
+# is no per-node value to preserve.
+env["GLOO_SOCKET_IFNAME"] = os.environ["GLOO_SOCKET_IFNAME"]
+env["NCCL_SOCKET_IFNAME"] = os.environ["NCCL_SOCKET_IFNAME"]
+env["GLOO_SOCKET_FAMILY"] = os.environ["GLOO_SOCKET_FAMILY"]
 env["PYTHONPATH"] = f"/root/Megatron-LM/:{os.environ['SLIME_DIR']}"
 env["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
 env["NCCL_NVLS_ENABLE"] = "0"
@@ -424,7 +545,7 @@ print(json.dumps({"env_vars": env}))
 PY
 )
 
-ray job submit --address="http://127.0.0.1:8265" \
+ray job submit --address="http://127.0.0.1:${RAY_DASHBOARD_PORT}" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 -u train.py \
    --actor-num-nodes "${ACTOR_NUM_NODES}" \
